@@ -31,7 +31,10 @@ class OpenRouterAgent:
         # Initialize OpenAI client with OpenRouter
         self.client = OpenAI(
             base_url=self.config['openrouter']['base_url'],
-            api_key=self.config['openrouter']['api_key']
+            api_key=self.config['openrouter']['api_key'],
+            # Bounded requests keep hung API calls from blocking the agent
+            # loop and the orchestrator's thread pool forever
+            timeout=self.config['openrouter'].get('request_timeout', 120)
         )
         
         # Discover tools dynamically
@@ -47,22 +50,26 @@ class OpenRouterAgent:
     def call_llm(self, messages):
         """Make OpenRouter API call with tools"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.config['openrouter']['model'],
-                messages=messages,
-                tools=self.tools
-            )
+            request_kwargs = {
+                "model": self.config['openrouter']['model'],
+                "messages": messages,
+            }
+            # An empty tools array is rejected by many providers
+            if self.tools:
+                request_kwargs["tools"] = self.tools
+            response = self.client.chat.completions.create(**request_kwargs)
             return response
         except Exception as e:
             raise Exception(f"LLM call failed: {str(e)}")
     
     def handle_tool_call(self, tool_call):
         """Handle a tool call and return the result message"""
+        # Resolve upfront so the error path below can reference it
+        tool_name = getattr(getattr(tool_call, "function", None), "name", "unknown")
         try:
             # Extract tool name and arguments
-            tool_name = tool_call.function.name
             tool_args = json.loads(tool_call.function.arguments)
-            
+
             # Call appropriate tool from tool_mapping
             if tool_name in self.tool_mapping:
                 tool_result = self.tool_mapping[tool_name](**tool_args)
@@ -134,47 +141,44 @@ class OpenRouterAgent:
             
             # Call LLM
             response = self.call_llm(messages)
-            
-            # Add the response to messages
+
+            # Add the response to messages. Only include tool_calls when the
+            # model actually made some: a null tool_calls field is rejected
+            # by several providers.
             assistant_message = response.choices[0].message
-            messages.append({
-                "role": "assistant",
-                "content": assistant_message.content,
-                "tool_calls": assistant_message.tool_calls
-            })
-            
+            message_dict = {"role": "assistant", "content": assistant_message.content}
+            if assistant_message.tool_calls:
+                message_dict["tool_calls"] = assistant_message.tool_calls
+            messages.append(message_dict)
+
             # Capture assistant content for full response
             if assistant_message.content:
                 full_response_content.append(assistant_message.content)
-            
+
             # Check if there are tool calls
             if assistant_message.tool_calls:
                 if not self.silent:
                     print(f"🔧 Agent making {len(assistant_message.tool_calls)} tool call(s)")
                 # Handle each tool call
-                task_completed = False
                 for tool_call in assistant_message.tool_calls:
                     if not self.silent:
                         print(f"   📞 Calling tool: {tool_call.function.name}")
                     tool_result = self.handle_tool_call(tool_call)
                     messages.append(tool_result)
-                    
+
                     # Check if this was the task completion tool
                     if tool_call.function.name == "mark_task_complete":
-                        task_completed = True
                         if not self.silent:
                             print("✅ Task completion tool called - exiting loop")
                         # Return FULL conversation content, not just completion message
                         return "\n\n".join(full_response_content)
-                
-                # If task was completed, we already returned above
-                if task_completed:
-                    return "\n\n".join(full_response_content)
             else:
+                # A response with no tool calls is the model's final answer;
+                # looping again would re-send the same conversation and
+                # duplicate the response until max_iterations.
                 if not self.silent:
-                    print("💭 Agent responded without tool calls - continuing loop")
-            
-            # Continue the loop regardless of whether there were tool calls or not
-        
-        # If max iterations reached, return whatever content we gathered
+                    print("💭 Agent responded without tool calls - task complete")
+                break
+
+        # Loop ended: either a final answer or max iterations reached
         return "\n\n".join(full_response_content) if full_response_content else "Maximum iterations reached. The agent may be stuck in a loop."

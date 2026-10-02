@@ -43,9 +43,9 @@ cd Multi-agent-channel
 # Install dependencies
 pip install -r requirements.txt
 
-# Set up environment variables
-cp .env.example .env
-# Add your API keys to .env file
+# Create your configuration
+cp config.yaml.example config.yaml
+# Add your OpenRouter API key to config.yaml
 ```
 
 ### Basic Usage
@@ -410,4 +410,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 git clone https://github.com/vedantparmar12/Multi-agent-channel.git
 cd Multi-agent-channel
 pip install -r requirements.txt
+cp config.yaml.example config.yaml
+# Edit config.yaml and add your OpenRouter API key
 ```

@@ -17,9 +17,8 @@ venv/
 config.yaml
 *.key
 
-# Test files  
-test_*.py
-\!tests/test_*.py
+# Stray test scripts at repo root (tests/ is tracked normally)
+/test_*.py
 
 # Logs
 *.log
