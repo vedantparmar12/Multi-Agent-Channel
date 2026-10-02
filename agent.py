@@ -1,8 +1,23 @@
 import json
+import sys
 import yaml
+from datetime import datetime
+from pathlib import Path
 from openai import OpenAI
 from tools import discover_tools
 from token_budget import TokenBudget
+from reliability import retry_call
+
+# Windows consoles often default to cp1252, where the progress emoji in the
+# non-silent prints below crash with UnicodeEncodeError (and the error
+# handler prints an emoji too, so it crashes twice). Degrade to replacement
+# characters instead of dying. agent.py is imported by every entry point,
+# so this covers main.py, orchestrator.py, and harness.py as well.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
 
 class OpenRouterAgent:
     def __init__(self, config_path="config.yaml", silent=False, context_aware=True):
@@ -18,6 +33,21 @@ class OpenRouterAgent:
         # prepare_messages, which truncates tool results and compacts old
         # history so loop iterations don't compound input cost
         self.budget = TokenBudget(self.config.get('harness', {}))
+
+        # Reliability: retries with backoff for transient API errors, and a
+        # fallback model cascade for when the primary model keeps failing
+        retry_config = self.config.get('harness', {}).get('retries', {})
+        self.retry_attempts = int(retry_config.get('attempts', 3))
+        self.retry_base_delay = float(retry_config.get('base_delay', 1.0))
+        self.fallback_models = list(self.config['openrouter'].get('fallback_models') or [])
+
+        # Local transcript: every original prompt and answer is appended to
+        # logs/transcript.jsonl. The wire copy of an input may be compressed,
+        # but the original always stays on disk - token savings never cost
+        # data.
+        transcript_config = self.config.get('harness', {}).get('transcript', {})
+        self.transcript_enabled = transcript_config.get('enabled', True)
+        self.transcript_path = Path('logs') / 'transcript.jsonl'
 
         # Usage accumulated across all API calls in this agent's lifetime
         self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
@@ -71,25 +101,42 @@ class OpenRouterAgent:
     
     
     def call_llm(self, messages):
-        """Make OpenRouter API call with tools.
+        """Make an OpenRouter API call with retries and model fallback.
 
-        The token-budget proxy runs here: messages are truncated/compacted
-        just before hitting the wire, so nothing is paid for twice.
+        The token-budget proxy runs first (messages are truncated/compacted
+        just before hitting the wire), then each model is attempted with
+        backoff on transient errors; non-transient errors fail over to the
+        next model immediately since retrying cannot fix them.
         """
-        try:
-            prepared = self.budget.prepare_messages(messages)
-            request_kwargs = {
-                "model": self.config['openrouter']['model'],
-                "messages": prepared,
-            }
-            # An empty tools array is rejected by many providers
-            if self.tools:
-                request_kwargs["tools"] = self.tools
-            response = self.client.chat.completions.create(**request_kwargs)
-            self._record_usage(response)
-            return response
-        except Exception as e:
-            raise Exception(f"LLM call failed: {str(e)}")
+        prepared = self.budget.prepare_messages(messages)
+        models = [self.config['openrouter']['model']] + self.fallback_models
+        last_error = None
+
+        for model in models:
+            try:
+                response = retry_call(
+                    lambda m=model: self._create_completion(m, prepared),
+                    attempts=self.retry_attempts,
+                    base_delay=self.retry_base_delay,
+                )
+                self._record_usage(response)
+                return response
+            except Exception as e:
+                last_error = e
+                if not self.silent:
+                    print(f"⚠️  model '{model}' unavailable: {e}")
+
+        raise Exception(f"LLM call failed: {last_error}")
+
+    def _create_completion(self, model, messages):
+        request_kwargs = {
+            "model": model,
+            "messages": messages,
+        }
+        # An empty tools array is rejected by many providers
+        if self.tools:
+            request_kwargs["tools"] = self.tools
+        return self.client.chat.completions.create(**request_kwargs)
 
     def _record_usage(self, response):
         """Accumulate real usage numbers returned by the API."""
@@ -102,6 +149,25 @@ class OpenRouterAgent:
     def get_usage(self):
         """Token usage across all calls made by this agent."""
         return dict(self.usage_totals)
+
+    def _append_transcript(self, original_input: str, output: str) -> None:
+        """Record the full, uncompressed input and final answer locally."""
+        if not self.transcript_enabled:
+            return
+        try:
+            self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "input": original_input,
+                "output": output,
+                "usage": self.get_usage(),
+            }
+            with self.transcript_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            # A failed transcript must never fail the run itself
+            if not self.silent:
+                print(f"⚠️  Could not write transcript: {e}")
     
     def handle_tool_call(self, tool_call):
         """Handle a tool call and return the result message"""
@@ -161,14 +227,20 @@ class OpenRouterAgent:
         return prompt
     
     def run(self, user_input: str):
-        """Run the agent with user input and return FULL conversation content"""
-        # Build system prompt with context and memory if available
+        """Run the agent with user input and return FULL conversation content.
+
+        Overlong inputs are compressed for the wire, but the original text
+        is preserved verbatim in the local transcript (logs/transcript.jsonl)
+        so compression never loses data.
+        """
         system_prompt = self._build_system_prompt()
+        original_input = user_input
+        result = self._run_loop(self.budget.compress_user_input(user_input), system_prompt)
+        self._append_transcript(original_input, result)
+        return result
 
-        # Compress overlong user input before its first send: the original
-        # text stays in the local transcript, only the wire copy shrinks
-        user_input = self.budget.compress_user_input(user_input)
-
+    def _run_loop(self, user_input: str, system_prompt: str):
+        """The agentic loop itself. Returns the full response content."""
         # Initialize messages with system prompt and user input
         messages = [
             {

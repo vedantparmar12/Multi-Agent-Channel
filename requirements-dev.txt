@@ -1,17 +1,32 @@
-# Development dependencies
+# Development, test, and validation tooling.
+# The agent's run_validation tool shells out to ruff/mypy/pytest; without
+# them it degrades gracefully ("not found on PATH").
+
+# Test suite
+pytest
 pytest-asyncio
 pytest-cov
 pytest-mock
 pytest-watch
+
+# Validation tools (also used at runtime by tools/validation_tool.py)
+ruff
+mypy
+
+# Formatting and linting
 black
 isort
 flake8
 bandit
 safety
 pre-commit
+
+# Debugging
 ipython
 ipdb
 watchdog
+
+# Docs
 sphinx
 sphinx-rtd-theme
 mkdocs
