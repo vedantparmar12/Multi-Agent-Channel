@@ -48,6 +48,57 @@ cp config.yaml.example config.yaml
 # Add your OpenRouter API key to config.yaml
 ```
 
+### Running the Agent Harness
+
+The harness is the recommended entry point: the agent loop, the tool
+library, persistent memory, and a token-budget proxy in one shell.
+
+```bash
+python harness.py
+```
+
+- Anything you type is a **query** — the agent loops over tools, then answers
+- `:ingest <text>` files a source into the memory wiki
+- `:lint` health-checks the wiki (contradictions, stale claims, orphans)
+
+## 🧠 Persistent Memory (Karpathy-style wiki)
+
+The agent maintains a markdown wiki in `memory/` that compounds across runs:
+
+```
+memory/
+  wiki/         # topic/entity pages, written by the agent itself
+  index.md      # catalog of every page (injected into each system prompt)
+  log.md        # append-only timeline: "## [date] action | title"
+```
+
+The index and recent activity are injected into every system prompt, so the
+agent starts each run already knowing what it knows. It files durable facts,
+decisions, and preferences itself via the `save_memory_page` tool. Plain
+files, no database, no embeddings — the timeline is even grep-able:
+
+```bash
+grep "^## \[" memory/log.md | tail -5
+```
+
+## 💰 Token Budget Proxy
+
+In an agentic loop the full conversation is re-sent on every iteration, so
+cost compounds each round. Every outgoing request passes through a local
+compression layer (`token_budget.py`):
+
+- **Input compression** — very long prompts are compressed extractively
+  before their first send (short prompts go verbatim)
+- **Tool-result truncation** — oversized tool outputs are clipped before
+  being fed back into the conversation
+- **History compaction** — when the estimated token count exceeds
+  `harness.history_budget`, older turns collapse into a digest while the
+  system prompt, the original request, and recent turns stay verbatim
+- **Usage reporting** — real token counts from the API are tracked per run
+  and printed by the harness
+
+All thresholds live under the `harness:` section of `config.yaml`.
+
 ### Basic Usage
 
 ```python

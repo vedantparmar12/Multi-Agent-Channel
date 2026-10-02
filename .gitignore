@@ -32,6 +32,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Agent memory wiki (runtime state, may hold private notes)
+memory/
+
 # Python
 *.pyc
 __pycache__/

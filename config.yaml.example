@@ -18,17 +18,45 @@ openrouter:
 
 system_prompt: |
   You are a capable AI assistant with access to tools, including web
-  search, file reading/writing, calculations, and code validation.
+  search, file reading/writing, calculations, code validation, and a
+  persistent memory wiki.
 
   Rules:
   - Use tools whenever they would improve the accuracy of your answer.
   - Read and write files only within the current project directory.
+  - Check your memory index before answering; save durable facts,
+    decisions, and user preferences with save_memory_page instead of
+    letting them vanish into chat history.
   - When the user's request is fully satisfied, you MUST call the
     mark_task_complete tool with a summary of what was accomplished.
 
 agent:
   # Maximum agentic-loop iterations (LLM calls + tool rounds) per run
   max_iterations: 10
+
+# Token budget proxy: every request passes through this before hitting
+# the API, so agentic-loop iterations don't compound input cost.
+harness:
+  # Estimated-token budget for the whole conversation; older turns are
+  # compacted into a digest when exceeded (system prompt + original
+  # request + recent turns are always kept verbatim)
+  history_budget: 24000
+  # Hard character cap per tool result sent back to the model
+  tool_result_limit: 2000
+  # User inputs longer than this many characters are compressed
+  # extractively before their first send (short inputs go verbatim)
+  input_compression_threshold: 4000
+  # Target size after compression, as a fraction of the threshold
+  input_compression_ratio: 0.5
+  # Turns kept verbatim at the end of the conversation during compaction
+  recent_turns_kept: 6
+
+# Persistent markdown-wiki memory (Karpathy-style). The agent reads the
+# index in every system prompt and files knowledge itself via the
+# save_memory_page tool. Plain files, no database.
+memory:
+  enabled: true
+  directory: memory
 
 orchestrator:
   # Number of agents run in parallel by orchestrator.py / make_it_heavy.py
