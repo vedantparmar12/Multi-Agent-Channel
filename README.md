@@ -1,466 +1,121 @@
-# Multi-Agent Channel - Enhanced Agentic Workflow Architecture
+# Multi-Agent Channel
 
-🚀 A powerful multi-agent system built with Pydantic AI that enables seamless orchestration of specialized AI agents with support for 100+ models through OpenRouter and direct provider integrations.
+Specialized AI agents with real tools, persistent memory, and a token
+budget that keeps long agent loops affordable. Runs on any model available
+through [OpenRouter](https://openrouter.ai/).
 
-## 🌟 Key Features
+## Highlights
 
-- **🤖 Multi-Model Support**: Use any AI model from OpenRouter, OpenAI, Anthropic, Google, and more
-- **🔀 Specialized Agents**: Code generation, research, analysis, refinement, and custom agents
-- **🧠 Knowledge Management**: Vector storage, semantic search, and validation systems
-- **⚡ Real-time Progress**: Live streaming updates and progress visualization
-- **🛠️ Extensive Tool Library**: 25+ built-in tools with template system
-- **🎮 Multiple Interfaces**: CLI, Web UI (Streamlit), and API
-- **🐳 Production Ready**: Docker support with monitoring and scaling
+- **Agent harness** — the loop, the tools, and the memory in one shell
+- **Multi-agent orchestration** — parallel agents with AI task decomposition and a synthesis pass
+- **Persistent memory** — a markdown wiki the agent writes itself, compounding across runs
+- **Token budget proxy** — long inputs compressed, tool results truncated, history compacted
+- **Reliability layer** — retries with backoff, model fallback cascade, optional reflection pass
+- **Sandboxed tools** — web search, file read/write, calculator, code validation, PRPs
 
-## 📚 Architecture Overview
-
-```
-Multi-Agent Channel/
-├── src/
-│   ├── agents/          # Specialized Pydantic AI agents
-│   ├── core/            # Core infrastructure (models, orchestration)
-│   ├── tools/           # Tool library with 25+ tools
-│   ├── knowledge/       # Vector store and knowledge management
-│   ├── progress/        # Progress tracking and visualization
-│   ├── ui/              # Streamlit UI components
-│   ├── api/             # FastAPI backend
-│   ├── cli/             # Command-line interface
-│   └── monitoring/      # Metrics and observability
-├── docker/              # Docker configuration
-├── tests/               # Comprehensive test suite
-└── examples/            # Usage examples and demos
-```
-
-## 🚀 Quick Start
-
-### Installation
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/vedantparmar12/Multi-agent-channel.git
-cd Multi-agent-channel
-
-# Install dependencies
+git clone https://github.com/vedantparmar12/Multi-Agent-Channel.git
+cd Multi-Agent-Channel
 pip install -r requirements.txt
 
-# Create your configuration
 cp config.yaml.example config.yaml
-# Add your OpenRouter API key to config.yaml
+# edit config.yaml and add your OpenRouter API key
 ```
-
-### Running the Agent Harness
-
-The harness is the recommended entry point: the agent loop, the tool
-library, persistent memory, and a token-budget proxy in one shell.
 
 ```bash
 python harness.py
 ```
 
-- Anything you type is a **query** — the agent loops over tools, then answers
-- `:ingest <text>` files a source into the memory wiki
-- `:lint` health-checks the wiki (contradictions, stale claims, orphans)
+That's it. Type a question and the agent searches, reads files, calculates,
+and answers. Two extra commands: `:ingest <text>` files knowledge into its
+memory wiki, `:lint` health-checks the wiki.
 
-## 🧠 Persistent Memory (Karpathy-style wiki)
+## Entry points
 
-The agent maintains a markdown wiki in `memory/` that compounds across runs:
+| Command | What it does |
+|---|---|
+| `python harness.py` | One capable agent: loop + tools + memory (recommended) |
+| `python main.py` | Minimal single-agent chat |
+| `python make_it_heavy.py` | Fans out N parallel agents, then synthesizes one answer |
+
+## How it works
+
+An agent is a loop over an LLM, a set of tools, and notes it maintains
+itself. This project is those three things plus a cost guard:
+
+1. **The loop** — the model thinks, calls tools, observes results, repeats,
+   then answers. Responses without tool calls end the loop; the
+   `mark_task_complete` tool lets the model finish explicitly.
+2. **The tools** — auto-discovered from `tools/`. Drop in a new file,
+   subclass `BaseTool`, and the agent can use it on the next start. File
+   access is sandboxed to the project root; credential files are blocked.
+3. **The memory** — a markdown wiki in `memory/`: topic pages the agent
+   writes via `save_memory_page`, an `index.md` injected into every system
+   prompt, and a grep-able `log.md` timeline (`grep "^## \[" memory/log.md`).
+   Knowledge compounds across runs instead of vanishing into chat history.
+4. **The token budget** — every request passes through a local proxy
+   (`token_budget.py`) before hitting the API, so loop iterations stop
+   compounding input cost (details below).
+5. **The reliability layer** — transient API errors retry with exponential
+   backoff and jitter; if the primary model keeps failing, the configured
+   fallbacks take over; an optional reflection pass has a critic re-answer
+   flawed responses.
+
+## Token cost & data safety
+
+Agentic loops re-send the whole conversation on every iteration, so cost
+compounds. The budget proxy caps that: inputs over ~4000 characters are
+compressed extractively, oversized tool results are truncated, and history
+older than the last few turns collapses into a digest once over budget.
+
+**Nothing is lost.** What the model sees shrinks — what you keep doesn't:
+
+- the local conversation always holds the full, untruncated history
+- the system prompt, the original request, and recent turns are never compacted
+- every original prompt and answer is written to `logs/transcript.jsonl`,
+  so compressed inputs remain fully recoverable
+
+All knobs live under `harness:` in `config.yaml`.
+
+## Configuration (`config.yaml`)
+
+| Key | Default | Purpose |
+|---|---|---|
+| `openrouter.model` | — | Primary model, any OpenRouter ID |
+| `openrouter.fallback_models` | `[]` | Tried in order if the primary keeps failing |
+| `openrouter.request_timeout` | `120` | Per-request timeout (seconds) |
+| `harness.history_budget` | `24000` | Est. token budget before history compaction |
+| `harness.tool_result_limit` | `2000` | Max characters per tool result on the wire |
+| `harness.input_compression_threshold` | `4000` | Inputs longer than this are compressed |
+| `harness.retries.attempts` | `3` | Retries per model (backoff + jitter) |
+| `harness.reflection.enabled` | `false` | Critic pass that re-answers flawed responses |
+| `harness.transcript.enabled` | `true` | Log prompts/answers to `logs/transcript.jsonl` |
+| `memory.enabled` | `true` | Persistent markdown-wiki memory |
+| `orchestrator.parallel_agents` | `4` | Number of agents fanned out by the orchestrator |
+
+## Project layout
 
 ```
-memory/
-  wiki/         # topic/entity pages, written by the agent itself
-  index.md      # catalog of every page (injected into each system prompt)
-  log.md        # append-only timeline: "## [date] action | title"
+agent.py            # the agent loop (LLM + tools + memory)
+harness.py          # user-facing shell: query / :ingest / :lint
+orchestrator.py     # parallel multi-agent execution + synthesis
+token_budget.py     # request compression proxy
+reliability.py      # retries, backoff, model fallback
+memory.py           # markdown-wiki memory store
+tools/              # auto-discovered tool library
+context/            # project-context loading + PRP engine
+tests/              # pytest suite
 ```
 
-The index and recent activity are injected into every system prompt, so the
-agent starts each run already knowing what it knows. It files durable facts,
-decisions, and preferences itself via the `save_memory_page` tool. Plain
-files, no database, no embeddings — the timeline is even grep-able:
+## Development
 
 ```bash
-grep "^## \[" memory/log.md | tail -5
-```
-
-## 💰 Token Budget Proxy
-
-In an agentic loop the full conversation is re-sent on every iteration, so
-cost compounds each round. Every outgoing request passes through a local
-compression layer (`token_budget.py`):
-
-- **Input compression** — very long prompts are compressed extractively
-  before their first send (short prompts go verbatim)
-- **Tool-result truncation** — oversized tool outputs are clipped before
-  being fed back into the conversation
-- **History compaction** — when the estimated token count exceeds
-  `harness.history_budget`, older turns collapse into a digest while the
-  system prompt, the original request, and recent turns stay verbatim
-- **Usage reporting** — real token counts from the API are tracked per run
-  and printed by the harness
-
-All thresholds live under the `harness:` section of `config.yaml`.
-
-### Basic Usage
-
-```python
-from src.agents.base_agent import BaseAgent
-from src.core.model_provider import ModelConfig
-
-# Configure with your API keys
-config = ModelConfig(
-    openrouter_api_key="your-openrouter-key",
-    openai_api_key="your-openai-key",
-    anthropic_api_key="your-anthropic-key"
-)
-
-# Create an agent with any model
-agent = BaseAgent(
-    model="anthropic/claude-3.5-sonnet",  # or any model from 100+ options
-    model_config=config
-)
-
-# Run the agent
-result = await agent.run("Your prompt here", deps)
-```
-
-## 🤖 Available Agents
-
-### 1. Code Generator Agent
-Generates high-quality code with documentation, tests, and security checks.
-
-```python
-from src.agents.code_generator import CodeGeneratorAgent, CodeGeneratorDeps
-
-agent = CodeGeneratorAgent(model="openai/gpt-4-turbo")
-deps = CodeGeneratorDeps(
-    language="python",
-    include_tests=True,
-    include_docs=True,
-    security_check=True
-)
-result = await agent.run("Create a REST API", deps)
-```
-
-### 2. Research Agent
-Conducts comprehensive research with source tracking and analysis.
-
-```python
-from src.agents.research_agent import ResearchAgent, ResearchDeps
-
-agent = ResearchAgent(model="anthropic/claude-3-opus")
-deps = ResearchDeps(
-    topic="quantum computing",
-    depth="comprehensive",
-    include_sources=True
-)
-result = await agent.run("Research latest developments", deps)
-```
-
-### 3. Analysis Agent
-Performs deep analysis on code, data, or systems.
-
-```python
-from src.agents.analysis_agent import AnalysisAgent, AnalysisDeps
-
-agent = AnalysisAgent(model="anthropic/claude-3.5-sonnet")
-deps = AnalysisDeps(
-    analysis_type="code_quality",
-    include_recommendations=True
-)
-result = await agent.run("Analyze this codebase", deps)
-```
-
-### 4. Tools Refiner Agent
-Enhances code with additional tools and capabilities.
-
-```python
-from src.agents.tools_refiner import ToolsRefinerAgent, ToolsRefinerDeps
-
-agent = ToolsRefinerAgent(model="groq/mixtral-8x7b-32768")
-deps = ToolsRefinerDeps(
-    code="your code here",
-    requested_tools=["logging", "error_handling", "caching"]
-)
-result = await agent.run("Add production features", deps)
-```
-
-## 🎯 Multi-Model Support
-
-Access 100+ AI models through a unified interface:
-
-### Supported Providers
-- **OpenRouter**: Access to all OpenRouter models
-- **OpenAI**: GPT-4, GPT-3.5, and other OpenAI models
-- **Anthropic**: Claude 3 (Opus, Sonnet, Haiku)
-- **Google**: Gemini Pro models
-- **Meta**: Llama models
-- **Mistral**: Mixtral and other models
-- **Groq**: Ultra-fast inference
-
-### Model Selection
-
-```python
-# Automatic model recommendations
-from src.core.model_provider import ModelProvider
-
-provider = ModelProvider(config=model_config)
-
-# Get best model for coding
-coding_model = provider.recommend_model(
-    task_type="coding",
-    budget_priority=False
-)
-
-# Get fastest model
-fast_model = provider.recommend_model(
-    task_type="general",
-    speed_priority=True
-)
-
-# Get most affordable model
-budget_model = provider.recommend_model(
-    task_type="general",
-    budget_priority=True
-)
-```
-
-## 🛠️ Tool System
-
-25+ built-in tools organized by category:
-
-### Available Tools
-
-**Development Tools**
-- `code_analyzer`: Analyze code structure and quality
-- `code_formatter`: Format code according to standards
-- `dependency_manager`: Manage project dependencies
-- `test_generator`: Generate unit tests
-- `documentation_generator`: Create documentation
-
-**Research Tools**
-- `web_searcher`: Search the web for information
-- `arxiv_searcher`: Search academic papers
-- `news_aggregator`: Aggregate news from multiple sources
-- `trend_analyzer`: Analyze trends and patterns
-
-**Data Tools**
-- `data_cleaner`: Clean and preprocess data
-- `data_transformer`: Transform data formats
-- `schema_validator`: Validate data schemas
-- `data_visualizer`: Create data visualizations
-
-**System Tools**
-- `file_manager`: Manage files and directories
-- `process_monitor`: Monitor system processes
-- `log_analyzer`: Analyze log files
-- `performance_profiler`: Profile performance
-
-**Security Tools**
-- `vulnerability_scanner`: Scan for vulnerabilities
-- `encryption_tool`: Encrypt/decrypt data
-- `auth_manager`: Manage authentication
-- `security_auditor`: Audit security
-
-## 🎮 Interfaces
-
-### 1. Command Line Interface (CLI)
-
-```bash
-# Run a single agent
-agent-cli run "Your prompt" --model "anthropic/claude-3.5-sonnet"
-
-# Use a specific tool
-agent-cli tools search-web --query "latest AI news"
-
-# Generate from template
-agent-cli generate rest-api --name "UserAPI"
-
-# Index codebase for search
-agent-cli index ./src --output index.json
-```
-
-### 2. Web Interface (Streamlit)
-
-```bash
-# Start the Streamlit UI
-streamlit run src/ui/app.py
-
-# Features:
-# - Visual model selection
-# - Real-time progress tracking
-# - Multi-agent orchestration
-# - Results visualization
-```
-
-### 3. API Interface
-
-```bash
-# Start the FastAPI server
-uvicorn src.api.main:app --reload
-
-# Endpoints:
-# POST /agents/run
-# GET /models/list
-# POST /tools/execute
-# GET /progress/{task_id}
-```
-
-## 🐳 Docker Deployment
-
-```bash
-# Build and run with Docker Compose
-docker-compose up -d
-
-# Services included:
-# - API server
-# - Streamlit UI
-# - Redis for caching
-# - PostgreSQL for persistence
-# - Prometheus for monitoring
-# - Grafana for visualization
-```
-
-## 📊 Knowledge Management
-
-### Vector Store Integration
-
-```python
-from src.knowledge.vector_store import VectorStore
-
-# Initialize vector store
-store = VectorStore(
-    supabase_url="your-url",
-    supabase_key="your-key",
-    openai_api_key="your-key"
-)
-
-# Add documents
-await store.add_document(
-    content="Your content",
-    metadata={"category": "docs", "tags": ["api", "guide"]}
-)
-
-# Semantic search
-results = await store.search(
-    query="How to implement authentication",
-    limit=5
-)
-```
-
-### Validation System
-
-```python
-from src.knowledge.validation_gate import ValidationGate
-
-# Create validation gate
-gate = ValidationGate()
-
-# Validate code
-result = await gate.validate(
-    data={"code": "your code"},
-    rules=["syntax", "security", "performance"]
-)
-```
-
-## 🚀 Advanced Features
-
-### Grok Heavy Mode
-
-Deep analysis mode for complex tasks:
-
-```python
-from src.progress.grok_mode import GrokHeavyMode, GrokContext
-
-grok = GrokHeavyMode()
-context = GrokContext(
-    file_path="complex_system.py",
-    analysis_depth="DEEP",
-    include_patterns=True
-)
-
-result = await grok.analyze(context)
-```
-
-### Progress Tracking
-
-Real-time progress updates:
-
-```python
-from src.progress.progress_tracker import ProgressTracker
-
-tracker = ProgressTracker()
-
-# Create hierarchical tasks
-main_task = await tracker.create_task("main", "Main Task")
-sub_task = await tracker.create_task("sub", "Sub Task", parent_id="main")
-
-# Update progress
-await tracker.update_progress("sub", 50, "Processing...")
-```
-
-## 📈 Monitoring
-
-Built-in monitoring with Prometheus and Grafana:
-
-- Request metrics
-- Model usage statistics
-- Cost tracking
-- Performance metrics
-- Error rates
-
-## 🧪 Testing
-
-```bash
-# Run all tests
+pip install -r requirements-dev.txt
 pytest tests/
-
-# Run specific test category
-pytest tests/test_agents.py
-pytest tests/test_tools.py
-pytest tests/test_knowledge.py
-
-# Run with coverage
-pytest tests/ --cov=src --cov-report=html
 ```
 
-## 📝 Examples
+## License
 
-Check the `examples/` directory for:
-- Multi-model usage examples
-- Agent orchestration patterns
-- Tool integration examples
-- Knowledge management demos
-- Production deployment guides
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Built with [Pydantic AI](https://github.com/pydantic/pydantic-ai)
-- Powered by [OpenRouter](https://openrouter.ai/) for multi-model access
-- Vector storage by [Supabase](https://supabase.com/)
-- Monitoring with [Prometheus](https://prometheus.io/) and [Grafana](https://grafana.com/)
-
-## 📞 Support
-
-- Documentation: [docs/](docs/)
-- Issues: [GitHub Issues](https://github.com/vedantparmar12/Multi-agent-channel/issues)
-- Discussions: [GitHub Discussions](https://github.com/vedantparmar12/Multi-agent-channel/discussions)
-
----
-
-**Ready to build with multiple AI models?** 🚀
-
-```bash
-# Get started now
-git clone https://github.com/vedantparmar12/Multi-agent-channel.git
-cd Multi-agent-channel
-pip install -r requirements.txt
-cp config.yaml.example config.yaml
-# Edit config.yaml and add your OpenRouter API key
-```
+MIT — see [LICENSE](LICENSE).

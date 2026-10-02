@@ -12,6 +12,9 @@ openrouter:
   # Any model available on OpenRouter, e.g. google/gemini-2.5-flash,
   # anthropic/claude-sonnet-4, openai/gpt-4o
   model: "google/gemini-2.5-flash"
+  # Tried in order when the primary model keeps failing (after retries)
+  # fallback_models: ["openai/gpt-4o-mini", "meta-llama/llama-3.1-70b-instruct"]
+  fallback_models: []
   # Per-request timeout in seconds. Keeps hung API calls from blocking
   # the agent loop and the orchestrator's thread pool forever.
   request_timeout: 120
@@ -50,6 +53,21 @@ harness:
   input_compression_ratio: 0.5
   # Turns kept verbatim at the end of the conversation during compaction
   recent_turns_kept: 6
+  # Reliability: transient API errors (rate limits, timeouts, 5xx) are
+  # retried with exponential backoff + jitter before failing over to the
+  # fallback models above
+  retries:
+    attempts: 3
+    base_delay: 1.0
+  # Quality mode: a critic pass reviews each answer and the request is
+  # re-answered when the critic finds concrete flaws. Improves reliability,
+  # costs extra tokens per query - opt-in.
+  reflection:
+    enabled: false
+  # Every original prompt and answer is appended to logs/transcript.jsonl
+  # so compressed inputs stay fully recoverable (no data loss)
+  transcript:
+    enabled: true
 
 # Persistent markdown-wiki memory (Karpathy-style). The agent reads the
 # index in every system prompt and files knowledge itself via the

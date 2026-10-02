@@ -41,12 +41,47 @@ class AgentHarness:
         self.agent = OpenRouterAgent(config_path=config_path, silent=silent)
         self.memory_store = self.agent.memory_store
 
+        # Reflection (quality mode): a critic pass reviews each answer and
+        # re-answers the request when it finds concrete flaws. Doubles token
+        # cost per query in the worst case, so it is opt-in.
+        self.reflection_enabled = (
+            self.config.get('harness', {}).get('reflection', {}).get('enabled', False)
+        )
+
         # Per-run report, filled in by query()/ingest()/lint()
         self.last_report = {}
 
     def query(self, user_input: str) -> str:
         """Answer a question with the full agent loop (tools + memory)."""
-        return self._execute("query", user_input)
+        before = self.agent.get_usage()
+        answer = self.agent.run(user_input)
+        if self.reflection_enabled and answer:
+            answer = self._reflect(user_input, answer)
+        return self._finish("query", user_input, before, answer)
+
+    def _reflect(self, question: str, answer: str) -> str:
+        """Adversarial critic pass: verify the answer, re-answer if flawed.
+
+        The critic runs through the same agent loop, so it can use tools
+        (e.g. web search) to fact-check claims. One reflection round max -
+        endless self-critique loops are how agents stall.
+        """
+        critic_prompt = (
+            "Review this answer for factual errors, unsupported claims, or "
+            "missed parts of the request. Use tools to verify claims when "
+            "useful.\n\n"
+            f"REQUEST:\n{question}\n\nANSWER:\n{answer}\n\n"
+            "Reply exactly 'APPROVED' if the answer is good. Otherwise reply "
+            "'NEEDS_FIX:' followed by the specific problems."
+        )
+        critique = self.agent.run(critic_prompt)
+        if "NEEDS_FIX" not in critique.upper():
+            return answer
+        retry_prompt = (
+            f"{question}\n\nA reviewer found problems with a previous "
+            f"attempt:\n{critique}\n\nAddress every problem and answer again."
+        )
+        return self.agent.run(retry_prompt)
 
     def ingest(self, source_text: str) -> str:
         """File a raw source into the wiki: the agent summarizes it, updates
@@ -79,16 +114,19 @@ class AgentHarness:
         return self._execute("lint", prompt, log_title="wiki lint pass")
 
     def _execute(self, action: str, prompt: str, log_title: str = None) -> str:
-        # Snapshot usage so the report covers only this run
         before = self.agent.get_usage()
         response = self.agent.run(prompt)
+        return self._finish(action, log_title or prompt, before, response)
+
+    def _finish(self, action: str, title: str, before: dict, response: str) -> str:
+        """Bookkeeping shared by every operation: memory log + usage report."""
         after = self.agent.get_usage()
 
-        # Bookkeeping: every operation lands in the parseable memory log
+        # Every operation lands in the parseable memory log
         if self.memory_store is not None:
             try:
-                title = log_title or (prompt.strip().splitlines()[0][:80])
-                self.memory_store.append_log("query" if action == "query" else action, title)
+                first_line = (title or "").strip().splitlines()[0][:80] if (title or "").strip() else "untitled"
+                self.memory_store.append_log("query" if action == "query" else action, first_line)
             except Exception:
                 pass
 
@@ -131,6 +169,10 @@ def main():
     try:
         harness = AgentHarness()
         print(f"Using model: {harness.config['openrouter']['model']}")
+        if harness.agent.fallback_models:
+            print(f"Fallbacks: {', '.join(harness.agent.fallback_models)}")
+        if harness.reflection_enabled:
+            print("Reflection: on (each answer gets a critic pass)")
         if harness.memory_store is not None:
             pages = harness.memory_store.list_pages()
             print(f"Memory: {len(pages)} page(s) loaded from the wiki")
