@@ -37,6 +37,7 @@ class AgentHarness:
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
         self.silent = silent
+        self.config_path = config_path
 
         self.agent = OpenRouterAgent(config_path=config_path, silent=silent)
         self.memory_store = self.agent.memory_store
@@ -58,6 +59,23 @@ class AgentHarness:
         if self.reflection_enabled and answer:
             answer = self._reflect(user_input, answer)
         return self._finish("query", user_input, before, answer)
+
+    def plan_execute(self, task: str) -> str:
+        """Run a big task plan-and-execute: planner emits JSON steps, each
+        step runs in a fresh subagent with a clean context window, and a
+        final synthesis assembles the answer."""
+        from planning import PlanExecutor
+
+        before = self.agent.get_usage()
+        outcome = PlanExecutor(config_path=self.config_path, silent=self.silent).execute(task)
+        # Report the harness agent's usage only; step agents are separate
+        # instances (that is the point - clean windows), so their usage is
+        # reported by their own runs
+        answer = outcome["final"]
+        self._finish("plan", task, before, answer)
+        if not self.silent:
+            print(f"🧩 Plan: {len(outcome['plan'])} step(s) executed")
+        return answer
 
     def _reflect(self, question: str, answer: str) -> str:
         """Adversarial critic pass: verify the answer, re-answer if flawed.
@@ -163,7 +181,7 @@ def main():
     """Interactive CLI for the agent harness."""
     print("Agent Harness - loop + tools + persistent memory")
     print("Type 'quit', 'exit', or 'bye' to exit")
-    print("Commands: :ingest <paste source>  |  :lint  |  anything else is a query")
+    print("Commands: :ingest <source> | :lint | :plan <big task> | anything else is a query")
     print("-" * 60)
 
     try:
@@ -198,6 +216,13 @@ def main():
             if user_input.lower() == ":lint":
                 print("Agent: linting the memory wiki...")
                 response = harness.lint()
+            elif user_input.lower().startswith(":plan"):
+                task = user_input[len(":plan"):].strip()
+                if not task:
+                    print("Usage: :plan <big task - planned into steps, each run by a fresh subagent>")
+                    continue
+                print("Agent: planning and executing...")
+                response = harness.plan_execute(task)
             elif user_input.lower().startswith(":ingest"):
                 source = user_input[len(":ingest"):].strip()
                 if not source:

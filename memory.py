@@ -30,7 +30,7 @@ from typing import Dict, List, Optional
 # RLock because save_page calls append_log while already holding it.
 _WRITE_LOCK = threading.RLock()
 
-LOG_ACTIONS = ("query", "save", "read", "lint")
+LOG_ACTIONS = ("query", "save", "read", "lint", "plan", "ingest")
 LOG_ENTRY_RE = re.compile(r"^## \[(\d{4}-\d{2}-\d{2})\] (\w+) \| (.+)$", re.MULTILINE)
 
 

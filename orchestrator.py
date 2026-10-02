@@ -14,6 +14,24 @@ FALLBACK_QUESTION_TEMPLATES = [
     "Verify and cross-check facts about: {user_input}",
 ]
 
+DEFAULT_MAX_DYNAMIC_AGENTS = 8
+
+DEFAULT_TRIAGE_PROMPT = """You are a request triage router for a multi-agent system.
+
+Classify this request: "{user_input}"
+
+- "simple" if one capable agent can answer it directly: a single factual
+  question, a lookup, a calculation, chit-chat, a small code snippet.
+- "complex" if it benefits from parallel agents covering different angles:
+  research, comparisons, multi-facet analysis, "everything about X".
+
+For complex requests also propose how many agents (2 to {max_agents})
+the request actually deserves - do not pad: a two-sided comparison needs
+2-3, a broad survey might justify more.
+
+Respond with ONLY this JSON and nothing else:
+{{"complexity": "simple"|"complex", "num_agents": <int>, "reasoning": "<one line>"}}"""
+
 
 def build_fallback_questions(user_input: str, num_agents: int) -> List[str]:
     """Deterministic subtasks used when AI question generation fails.
@@ -31,12 +49,23 @@ class TaskOrchestrator:
         # Load configuration
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
         self.num_agents = self.config['orchestrator']['parallel_agents']
         self.task_timeout = self.config['orchestrator']['task_timeout']
         self.aggregation_strategy = self.config['orchestrator']['aggregation_strategy']
         self.silent = silent
-        
+
+        # Dynamic spawning: a cheap triage call classifies each request and
+        # proposes the agent count, instead of always fanning out the fixed
+        # configured number (simple requests skip the fan-out entirely)
+        orchestrator_config = self.config['orchestrator']
+        self.dynamic_enabled = orchestrator_config.get('dynamic', False)
+        self.max_dynamic_agents = int(orchestrator_config.get('max_agents', DEFAULT_MAX_DYNAMIC_AGENTS))
+        self.triage_prompt_template = orchestrator_config.get('triage_prompt', DEFAULT_TRIAGE_PROMPT)
+        # Agent count actually used by the current/last orchestrate() run;
+        # the progress display reads this instead of the static config value
+        self.active_count = self.num_agents
+
         # Track agent progress
         self.agent_progress = {}
         self.agent_results = {}
@@ -97,6 +126,76 @@ class TaskOrchestrator:
             return None
         return questions
     
+    def triage_request(self, user_input: str) -> Dict[str, Any]:
+        """Classify a request and propose an agent count for it.
+
+        Returns {"complexity": "simple"|"complex", "num_agents": int,
+        "reasoning": str}. On any failure, falls back to the configured
+        static agent count so dynamic mode degrades to the old behavior
+        rather than erroring.
+        """
+        fallback = {
+            "complexity": "complex",
+            "num_agents": self.num_agents,
+            "reasoning": "triage unavailable - using configured agent count",
+        }
+        try:
+            triage_agent = OpenRouterAgent(silent=True)
+            # One call, no tools: triage is routing, not research
+            triage_agent.tools = []
+            triage_agent.tool_mapping = {}
+
+            prompt = self.triage_prompt_template.format(
+                user_input=user_input,
+                max_agents=self.max_dynamic_agents,
+            )
+            parsed = self._parse_json_object(triage_agent.run(prompt))
+        except Exception:
+            return fallback
+
+        if parsed is None:
+            return fallback
+
+        complexity = parsed.get("complexity")
+        if complexity not in ("simple", "complex"):
+            return fallback
+
+        # Clamp the model-proposed count so it can't over-decompose trivia
+        # or fan out absurdly
+        try:
+            num_agents = int(parsed.get("num_agents", self.num_agents))
+        except (TypeError, ValueError):
+            num_agents = self.num_agents
+        num_agents = max(1, min(num_agents, self.max_dynamic_agents))
+
+        return {
+            "complexity": complexity,
+            "num_agents": num_agents,
+            "reasoning": str(parsed.get("reasoning", ""))[:200],
+        }
+
+    @staticmethod
+    def _parse_json_object(response: str) -> Optional[Dict[str, Any]]:
+        """Parse a JSON object from a model response, tolerating prose and
+        markdown fences."""
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+
+        candidates = [text]
+        brace_match = re.search(r"\{.*\}", text, re.DOTALL)
+        if brace_match:
+            candidates.append(brace_match.group(0))
+
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
     def update_agent_progress(self, agent_id: int, status: str, result: str = None):
         """Thread-safe progress tracking"""
         with self.progress_lock:
@@ -205,29 +304,47 @@ class TaskOrchestrator:
     
     def orchestrate(self, user_input: str):
         """
-        Main orchestration method.
-        Takes user input, delegates to parallel agents, and returns aggregated result.
+        Main orchestration method. Takes user input, decides how much
+        firepower it needs (triage), delegates to agents, and returns the
+        aggregated result.
         """
-        
         # Reset progress tracking
         self.agent_progress = {}
         self.agent_results = {}
-        
-        # Decompose task into subtasks
-        subtasks = self.decompose_task(user_input, self.num_agents)
-        
+
+        # Route: simple requests get one agent; complex requests get a
+        # model-proposed number of parallel agents
+        num_agents = self.num_agents
+        if self.dynamic_enabled:
+            triage = self.triage_request(user_input)
+            if not self.silent:
+                print(f"🧭 Triage: {triage['complexity']}"
+                      + (f" x{triage['num_agents']}" if triage['complexity'] == 'complex' else "")
+                      + (f" - {triage['reasoning']}" if triage.get('reasoning') else ""))
+            if triage["complexity"] == "simple":
+                # One capable agent, no decomposition, no synthesis pass -
+                # 1 API call path instead of N+2
+                self.active_count = 1
+                self.agent_progress = {0: "QUEUED"}
+                result = self.run_agent_parallel(0, user_input)
+                return result["response"]
+            num_agents = triage["num_agents"]
+
+        self.active_count = num_agents
+        subtasks = self.decompose_task(user_input, num_agents)
+
         # Initialize progress tracking
-        for i in range(self.num_agents):
+        for i in range(num_agents):
             self.agent_progress[i] = "QUEUED"
-        
+
         # Execute agents in parallel
         agent_results = []
 
-        with ThreadPoolExecutor(max_workers=self.num_agents) as executor:
+        with ThreadPoolExecutor(max_workers=num_agents) as executor:
             # Submit all agent tasks
             future_to_agent = {
                 executor.submit(self.run_agent_parallel, i, subtasks[i]): i
-                for i in range(self.num_agents)
+                for i in range(num_agents)
             }
 
             try:

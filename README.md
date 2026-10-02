@@ -7,7 +7,8 @@ through [OpenRouter](https://openrouter.ai/).
 ## Highlights
 
 - **Agent harness** — the loop, the tools, and the memory in one shell
-- **Multi-agent orchestration** — parallel agents with AI task decomposition and a synthesis pass
+- **Dynamic orchestration** — a triage call decides per request how many agents it deserves (simple → one, complex → up to 8)
+- **Plan-and-execute** — big tasks split into steps, each run by a fresh subagent with a clean context window
 - **Persistent memory** — a markdown wiki the agent writes itself, compounding across runs
 - **Token budget proxy** — long inputs compressed, tool results truncated, history compacted
 - **Reliability layer** — retries with backoff, model fallback cascade, optional reflection pass
@@ -29,8 +30,9 @@ python harness.py
 ```
 
 That's it. Type a question and the agent searches, reads files, calculates,
-and answers. Two extra commands: `:ingest <text>` files knowledge into its
-memory wiki, `:lint` health-checks the wiki.
+and answers. Extra commands: `:plan <big task>` splits it into steps run by
+fresh subagents, `:ingest <text>` files knowledge into the memory wiki,
+`:lint` health-checks the wiki.
 
 ## Entry points
 
@@ -62,6 +64,15 @@ itself. This project is those three things plus a cost guard:
    backoff and jitter; if the primary model keeps failing, the configured
    fallbacks take over; an optional reflection pass has a critic re-answer
    flawed responses.
+6. **Dynamic orchestration** (`orchestrator.py`) — before fanning out, a
+   cheap triage call classifies the request: simple questions get one agent
+   (no fan-out, no synthesis — 1 call instead of N+2); complex ones get a
+   model-proposed agent count, hard-capped at `orchestrator.max_agents`.
+7. **Plan-and-execute** (`planning.py`) — for big tasks (`:plan` in the
+   harness): a planner emits a JSON step list; each step runs in a **fresh
+   subagent with a clean context window** carrying only the task, a compact
+   summary of prior steps, and its own instruction — long tasks never drown
+   in a growing transcript. A final synthesis assembles the answer.
 
 ## Token cost & data safety
 
@@ -92,15 +103,19 @@ All knobs live under `harness:` in `config.yaml`.
 | `harness.retries.attempts` | `3` | Retries per model (backoff + jitter) |
 | `harness.reflection.enabled` | `false` | Critic pass that re-answers flawed responses |
 | `harness.transcript.enabled` | `true` | Log prompts/answers to `logs/transcript.jsonl` |
+| `harness.planning.max_steps` | `10` | Cap on plan length for `:plan` tasks |
 | `memory.enabled` | `true` | Persistent markdown-wiki memory |
-| `orchestrator.parallel_agents` | `4` | Number of agents fanned out by the orchestrator |
+| `orchestrator.dynamic` | `true` | Triage each request instead of a fixed agent count |
+| `orchestrator.max_agents` | `8` | Hard cap on agents per request |
+| `orchestrator.parallel_agents` | `4` | Agent count when dynamic is off, or triage fallback |
 
 ## Project layout
 
 ```
 agent.py            # the agent loop (LLM + tools + memory)
-harness.py          # user-facing shell: query / :ingest / :lint
-orchestrator.py     # parallel multi-agent execution + synthesis
+harness.py          # user-facing shell: query / :plan / :ingest / :lint
+orchestrator.py     # dynamic multi-agent fan-out + synthesis
+planning.py         # plan-and-execute: steps as clean-window subagents
 token_budget.py     # request compression proxy
 reliability.py      # retries, backoff, model fallback
 memory.py           # markdown-wiki memory store
