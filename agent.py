@@ -2,17 +2,40 @@ import json
 import yaml
 from openai import OpenAI
 from tools import discover_tools
+from token_budget import TokenBudget
 
 class OpenRouterAgent:
     def __init__(self, config_path="config.yaml", silent=False, context_aware=True):
         # Load configuration
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-        
+
         # Silent mode for orchestrator (suppresses debug output)
         self.silent = silent
         self.context_aware = context_aware
-        
+
+        # Token budget middleware: every outgoing request passes through
+        # prepare_messages, which truncates tool results and compacts old
+        # history so loop iterations don't compound input cost
+        self.budget = TokenBudget(self.config.get('harness', {}))
+
+        # Usage accumulated across all API calls in this agent's lifetime
+        self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+
+        # Persistent markdown-wiki memory (Karpathy-style). Memory tools in
+        # tools/memory_tool.py build their own store pointed at the same
+        # directory, so the agent reads and writes one wiki.
+        self.memory_store = None
+        if self.config.get('memory', {}).get('enabled', True):
+            try:
+                from memory import MemoryStore
+                self.memory_store = MemoryStore(
+                    directory=self.config['memory'].get('directory', 'memory')
+                )
+            except Exception as e:
+                if not self.silent:
+                    print(f"⚠️  Memory disabled: {e}")
+
         # Initialize context loader if context awareness is enabled
         self.context_loader = None
         self.project_context = None
@@ -48,19 +71,37 @@ class OpenRouterAgent:
     
     
     def call_llm(self, messages):
-        """Make OpenRouter API call with tools"""
+        """Make OpenRouter API call with tools.
+
+        The token-budget proxy runs here: messages are truncated/compacted
+        just before hitting the wire, so nothing is paid for twice.
+        """
         try:
+            prepared = self.budget.prepare_messages(messages)
             request_kwargs = {
                 "model": self.config['openrouter']['model'],
-                "messages": messages,
+                "messages": prepared,
             }
             # An empty tools array is rejected by many providers
             if self.tools:
                 request_kwargs["tools"] = self.tools
             response = self.client.chat.completions.create(**request_kwargs)
+            self._record_usage(response)
             return response
         except Exception as e:
             raise Exception(f"LLM call failed: {str(e)}")
+
+    def _record_usage(self, response):
+        """Accumulate real usage numbers returned by the API."""
+        usage = getattr(response, "usage", None)
+        if usage:
+            self.usage_totals["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
+            self.usage_totals["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+            self.usage_totals["requests"] += 1
+
+    def get_usage(self):
+        """Token usage across all calls made by this agent."""
+        return dict(self.usage_totals)
     
     def handle_tool_call(self, tool_call):
         """Handle a tool call and return the result message"""
@@ -93,28 +134,41 @@ class OpenRouterAgent:
             }
     
     def _build_system_prompt(self) -> str:
-        """Build system prompt with context if available."""
-        base_prompt = self.config['system_prompt']
-        
-        if not self.context_aware or not self.project_context:
-            return base_prompt
-        
-        # Add context section
-        context_section = "\n\n## Project Context\n\n"
-        context_section += self.project_context.get_formatted_context()
-        
-        # Add available tools reminder
-        context_section += "\n\n## Available Tools\n"
-        for tool_name in self.tool_mapping.keys():
-            context_section += f"- {tool_name}\n"
-        
-        return base_prompt + context_section
+        """Build system prompt with context and memory if available."""
+        prompt = self.config['system_prompt']
+
+        if self.context_aware and self.project_context:
+            # Add context section
+            context_section = "\n\n## Project Context\n\n"
+            context_section += self.project_context.get_formatted_context()
+
+            # Add available tools reminder
+            context_section += "\n\n## Available Tools\n"
+            for tool_name in self.tool_mapping.keys():
+                context_section += f"- {tool_name}\n"
+
+            prompt += context_section
+
+        # Memory index + recent log so the agent starts every run already
+        # knowing what it knows (the wiki is the compounding artifact)
+        if self.memory_store is not None:
+            try:
+                prompt += self.memory_store.get_prompt_section()
+            except Exception as e:
+                if not self.silent:
+                    print(f"⚠️  Could not inject memory: {e}")
+
+        return prompt
     
     def run(self, user_input: str):
         """Run the agent with user input and return FULL conversation content"""
-        # Build system prompt with context if available
+        # Build system prompt with context and memory if available
         system_prompt = self._build_system_prompt()
-        
+
+        # Compress overlong user input before its first send: the original
+        # text stays in the local transcript, only the wire copy shrinks
+        user_input = self.budget.compress_user_input(user_input)
+
         # Initialize messages with system prompt and user input
         messages = [
             {
