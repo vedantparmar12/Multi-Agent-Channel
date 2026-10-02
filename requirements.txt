@@ -19,7 +19,6 @@ streamlit
 fastapi
 uvicorn
 httpx
-asyncio
 redis
 celery
 pandas

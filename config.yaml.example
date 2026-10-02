@@ -1,0 +1,72 @@
+# Multi-Agent Channel configuration
+#
+# Copy this file to config.yaml and fill in your API key:
+#   cp config.yaml.example config.yaml
+#
+# config.yaml is gitignored, so your key never leaves this machine.
+
+openrouter:
+  base_url: "https://openrouter.ai/api/v1"
+  # Get a key at https://openrouter.ai/settings/keys
+  api_key: "sk-or-v1-your-key-here"
+  # Any model available on OpenRouter, e.g. google/gemini-2.5-flash,
+  # anthropic/claude-sonnet-4, openai/gpt-4o
+  model: "google/gemini-2.5-flash"
+  # Per-request timeout in seconds. Keeps hung API calls from blocking
+  # the agent loop and the orchestrator's thread pool forever.
+  request_timeout: 120
+
+system_prompt: |
+  You are a capable AI assistant with access to tools, including web
+  search, file reading/writing, calculations, and code validation.
+
+  Rules:
+  - Use tools whenever they would improve the accuracy of your answer.
+  - Read and write files only within the current project directory.
+  - When the user's request is fully satisfied, you MUST call the
+    mark_task_complete tool with a summary of what was accomplished.
+
+agent:
+  # Maximum agentic-loop iterations (LLM calls + tool rounds) per run
+  max_iterations: 10
+
+orchestrator:
+  # Number of agents run in parallel by orchestrator.py / make_it_heavy.py
+  parallel_agents: 4
+  # Seconds to wait for parallel agents before giving up on stragglers
+  task_timeout: 300
+  aggregation_strategy: "consensus"
+
+  # Prompt used to split a user request into per-agent questions.
+  # {user_input} and {num_agents} are substituted at runtime.
+  question_generation_prompt: |
+    You are a research orchestrator. Break the following user request into
+    exactly {num_agents} distinct, non-overlapping research questions that
+    together cover the request from different angles.
+
+    User request: "{user_input}"
+
+    Respond with ONLY a JSON array of exactly {num_agents} strings and
+    nothing else. Example format: ["question one", "question two"]
+
+  # Prompt used to merge the parallel agents' answers into one response.
+  # {num_responses} and {agent_responses} are substituted at runtime.
+  synthesis_prompt: |
+    You are a synthesis agent. Below are {num_responses} responses from
+    parallel research agents, each answering a different sub-question of
+    the same original request.
+
+    Synthesize them into a single, coherent, comprehensive final answer.
+    Resolve contradictions, remove duplication, and keep the strongest
+    evidence. Respond directly with the final answer only.
+
+    {agent_responses}
+
+# Optional tool configuration
+search:
+  # User-Agent header used when fetching pages found via web search
+  user_agent: "Mozilla/5.0 (compatible; MultiAgentChannel/1.0)"
+
+validation:
+  # Timeout in seconds for ruff / mypy / pytest subprocesses
+  timeout: 300

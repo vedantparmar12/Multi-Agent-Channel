@@ -69,6 +69,9 @@ class CalculatorTool(BaseTool):
         elif isinstance(node, ast.BinOp):  # Binary operations
             left = self._safe_eval(node.left)
             right = self._safe_eval(node.right)
+            if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+                # Expressions like 9**9**9 otherwise hang the tool
+                raise ValueError("Exponent too large (limit is 1000)")
             if type(node.op) in self.safe_operators:
                 return self.safe_operators[type(node.op)](left, right)
             else:

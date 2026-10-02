@@ -1,10 +1,30 @@
 import json
+import re
 import yaml
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
+from typing import List, Dict, Any, Optional
 from agent import OpenRouterAgent
+
+FALLBACK_QUESTION_TEMPLATES = [
+    "Research comprehensive information about: {user_input}",
+    "Analyze and provide insights about: {user_input}",
+    "Find alternative perspectives on: {user_input}",
+    "Verify and cross-check facts about: {user_input}",
+]
+
+
+def build_fallback_questions(user_input: str, num_agents: int) -> List[str]:
+    """Deterministic subtasks used when AI question generation fails.
+
+    Cycles the templates so any agent count is covered (the previous
+    hardcoded 4-item list caused an IndexError for parallel_agents > 4).
+    """
+    return [
+        f"[Angle {i + 1}] " + FALLBACK_QUESTION_TEMPLATES[i % len(FALLBACK_QUESTION_TEMPLATES)].format(user_input=user_input)
+        for i in range(num_agents)
+    ]
 
 class TaskOrchestrator:
     def __init__(self, config_path="config.yaml", silent=False):
@@ -42,24 +62,40 @@ class TaskOrchestrator:
         try:
             # Get AI-generated questions
             response = question_agent.run(generation_prompt)
-            
-            # Parse JSON response
-            questions = json.loads(response.strip())
-            
-            # Validate we got the right number of questions
-            if len(questions) != num_agents:
-                raise ValueError(f"Expected {num_agents} questions, got {len(questions)}")
-            
+            questions = self._parse_questions(response)
+        except Exception:
+            # Any failure (API error, malformed output) falls back to
+            # deterministic subtasks instead of crashing orchestration
+            questions = None
+
+        if questions is not None and len(questions) == num_agents:
             return questions
-            
-        except (json.JSONDecodeError, ValueError):
-            # Fallback: create simple variations if AI fails
-            return [
-                f"Research comprehensive information about: {user_input}",
-                f"Analyze and provide insights about: {user_input}",
-                f"Find alternative perspectives on: {user_input}",
-                f"Verify and cross-check facts about: {user_input}"
-            ][:num_agents]
+        return build_fallback_questions(user_input, num_agents)
+
+    @staticmethod
+    def _parse_questions(response: str) -> Optional[List[str]]:
+        """Parse a JSON array of questions, tolerating prose/markdown wrappers."""
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL).strip()
+
+        try:
+            questions = json.loads(text)
+        except json.JSONDecodeError:
+            # Models often wrap the JSON array in prose; grab the array itself
+            match = re.search(r"\[.*\]", text, re.DOTALL)
+            if match is None:
+                return None
+            try:
+                questions = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+        if not isinstance(questions, list):
+            return None
+        if not all(isinstance(q, str) and q.strip() for q in questions):
+            return None
+        return questions
     
     def update_agent_progress(self, agent_id: int, status: str, result: str = None):
         """Thread-safe progress tracking"""
@@ -186,25 +222,44 @@ class TaskOrchestrator:
         
         # Execute agents in parallel
         agent_results = []
-        
+
         with ThreadPoolExecutor(max_workers=self.num_agents) as executor:
             # Submit all agent tasks
             future_to_agent = {
-                executor.submit(self.run_agent_parallel, i, subtasks[i]): i 
+                executor.submit(self.run_agent_parallel, i, subtasks[i]): i
                 for i in range(self.num_agents)
             }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_agent, timeout=self.task_timeout):
-                try:
-                    result = future.result()
-                    agent_results.append(result)
-                except Exception as e:
+
+            try:
+                # Collect results as they complete
+                for future in as_completed(future_to_agent, timeout=self.task_timeout):
                     agent_id = future_to_agent[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        result = {
+                            "agent_id": agent_id,
+                            "status": "error",
+                            "response": f"Agent {agent_id + 1} failed: {str(e)}",
+                            "execution_time": 0
+                        }
+                    agent_results.append(result)
+            except FuturesTimeoutError:
+                # as_completed raises from the iterator itself, which sits
+                # outside the inner try/except. Harvest whatever finished by
+                # the deadline and mark the rest as timed out.
+                for future, agent_id in future_to_agent.items():
+                    if future.done() and not future.cancelled():
+                        try:
+                            agent_results.append(future.result())
+                            continue
+                        except Exception:
+                            pass
+                    future.cancel()
                     agent_results.append({
                         "agent_id": agent_id,
                         "status": "timeout",
-                        "response": f"Agent {agent_id + 1} timed out or failed: {str(e)}",
+                        "response": f"Agent {agent_id + 1} timed out after {self.task_timeout}s",
                         "execution_time": self.task_timeout
                     })
         

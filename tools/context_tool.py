@@ -29,7 +29,7 @@ class ContextTool(BaseTool):
                     "description": "Whether to include code examples in the context",
                     "default": True
                 },
-                "format": {
+                "output_format": {
                     "type": "string",
                     "description": "Format for the context: 'full' or 'summary'",
                     "enum": ["full", "summary"],
@@ -38,22 +38,22 @@ class ContextTool(BaseTool):
             },
             "required": []
         }
-    
-    def execute(self, include_examples: bool = True, format: str = "full") -> Dict[str, Any]:
+
+    def execute(self, include_examples: bool = True, output_format: str = "full") -> Dict[str, Any]:
         """Load and return project context.
-        
+
         Args:
             include_examples: Whether to include code examples
-            format: How to format the context
-            
+            output_format: How to format the context
+
         Returns:
             Dictionary containing project context
         """
         try:
             # Load full context
             context = self.context_loader.load_project_context()
-            
-            if format == "summary":
+
+            if output_format == "summary":
                 # Return summary view
                 return {
                     "status": "success",

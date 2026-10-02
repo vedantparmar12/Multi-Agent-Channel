@@ -1,16 +1,18 @@
 """Tool for running validation and tests on code."""
 
+import re
 import subprocess
 from typing import Dict, Any
 from pathlib import Path
-from .base_tool import BaseTool
+from .base_tool import BaseTool, resolve_safe_path
 
 class ValidationTool(BaseTool):
     """Tool that runs linting, type checking, and tests."""
-    
+
     def __init__(self, config: dict):
         self.config = config
         self.validation_config = config.get('validation', {})
+        self.timeout = self.validation_config.get('timeout', 300)
     
     @property
     def name(self) -> str:
@@ -86,93 +88,88 @@ class ValidationTool(BaseTool):
                 "error": f"Validation failed: {str(e)}"
             }
     
-    def _run_linting(self, target: str, fix: bool) -> Dict[str, Any]:
-        """Run ruff linting."""
+    def _run_command(self, cmd: list) -> Dict[str, Any]:
+        """Run a validation command with a bounded lifetime.
+
+        Without a timeout a hung ruff/mypy/pytest process blocks the agent
+        loop forever.
+        """
         try:
-            cmd = ["ruff", "check", target]
-            if fix:
-                cmd.append("--fix")
-            
             result = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True
+                text=True,
+                timeout=self.timeout
             )
-            
-            return {
-                "success": result.returncode == 0,
-                "output": result.stdout,
-                "errors": result.stderr,
-                "fixed": fix and "fixed" in result.stdout.lower()
-            }
-        except FileNotFoundError:
-            return {
-                "success": False,
-                "error": "ruff not found. Install with: pip install ruff"
-            }
-    
-    def _run_typecheck(self, target: str) -> Dict[str, Any]:
-        """Run mypy type checking."""
-        try:
-            result = subprocess.run(
-                ["mypy", target, "--ignore-missing-imports"],
-                capture_output=True,
-                text=True
-            )
-            
             return {
                 "success": result.returncode == 0,
                 "output": result.stdout,
                 "errors": result.stderr
             }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "error": f"'{cmd[0]}' timed out after {self.timeout}s"
+            }
         except FileNotFoundError:
             return {
                 "success": False,
-                "error": "mypy not found. Install with: pip install mypy"
+                "error": f"'{cmd[0]}' not found on PATH"
             }
-    
+
+    def _resolve_target(self, target: str) -> Path:
+        # Targets are LLM-chosen; keep them inside the project root
+        return resolve_safe_path(target)
+
+    def _run_linting(self, target: str, fix: bool) -> Dict[str, Any]:
+        """Run ruff linting."""
+        try:
+            safe_target = self._resolve_target(target)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        cmd = ["ruff", "check", str(safe_target)]
+        if fix:
+            cmd.append("--fix")
+
+        result = self._run_command(cmd)
+        if "output" in result:
+            result["fixed"] = fix and "fixed" in result["output"].lower()
+        return result
+
+    def _run_typecheck(self, target: str) -> Dict[str, Any]:
+        """Run mypy type checking."""
+        try:
+            safe_target = self._resolve_target(target)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        return self._run_command(["mypy", str(safe_target), "--ignore-missing-imports"])
+
     def _run_tests(self, target: str) -> Dict[str, Any]:
         """Run pytest tests."""
         try:
-            # Determine test path
-            if target == ".":
-                test_path = "tests/"
-            elif target.startswith("tests/"):
-                test_path = target
-            else:
-                # Find corresponding test file
-                path = Path(target)
-                test_file = f"test_{path.name}"
-                test_path = f"tests/{test_file}"
-            
-            result = subprocess.run(
-                ["pytest", test_path, "-v", "--tb=short"],
-                capture_output=True,
-                text=True
-            )
-            
-            # Parse test results
-            output_lines = result.stdout.split('\n')
-            passed = failed = 0
-            
-            for line in output_lines:
-                if " passed" in line and " failed" in line:
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if part == "passed":
-                            passed = int(parts[i-1])
-                        elif part == "failed":
-                            failed = int(parts[i-1])
-            
-            return {
-                "success": result.returncode == 0,
-                "output": result.stdout,
-                "errors": result.stderr,
-                "passed": passed,
-                "failed": failed
-            }
-        except FileNotFoundError:
-            return {
-                "success": False,
-                "error": "pytest not found. Install with: pip install pytest"
-            }
+            safe_target = self._resolve_target(target)
+            tests_dir = resolve_safe_path("tests")
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        # Determine test path
+        if target == ".":
+            test_path = "tests/"
+        elif tests_dir == safe_target or tests_dir in safe_target.parents:
+            test_path = str(safe_target)
+        else:
+            # Find corresponding test file
+            test_path = str(tests_dir / f"test_{safe_target.name}")
+
+        result = self._run_command(["pytest", test_path, "-v", "--tb=short"])
+        if "output" in result:
+            # pytest summary lines look like "3 passed, 1 failed in 0.5s";
+            # match each count independently so "5 passed in 0.1s" is counted
+            output = result["output"]
+            passed_match = re.search(r"(\d+) passed", output)
+            failed_match = re.search(r"(\d+) failed", output)
+            result["passed"] = int(passed_match.group(1)) if passed_match else 0
+            result["failed"] = int(failed_match.group(1)) if failed_match else 0
+        return result
