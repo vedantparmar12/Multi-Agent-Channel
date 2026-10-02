@@ -86,8 +86,8 @@ class OrchestratorCLI:
             print(f"● COMPLETED • {time_str}")
         print()
         
-        # Agent status lines
-        for i in range(self.orchestrator.num_agents):
+        # Agent status lines (follows the dynamic agent count set by triage)
+        for i in range(self.orchestrator.active_count):
             status = progress.get(i, "QUEUED")
             progress_bar = self.create_progress_bar(status)
             print(f"AGENT {i+1:02d}  {progress_bar}")
@@ -140,7 +140,10 @@ class OrchestratorCLI:
     def interactive_mode(self):
         """Run interactive CLI session"""
         print("Multi-Agent Orchestrator")
-        print(f"Configured for {self.orchestrator.num_agents} parallel agents")
+        if self.orchestrator.dynamic_enabled:
+            print(f"Dynamic spawning: up to {self.orchestrator.max_dynamic_agents} agents, decided per request")
+        else:
+            print(f"Configured for {self.orchestrator.num_agents} parallel agents")
         print("Type 'quit', 'exit', or 'bye' to exit")
         print("-" * 50)
         

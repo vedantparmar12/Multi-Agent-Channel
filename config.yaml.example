@@ -64,6 +64,14 @@ harness:
   # costs extra tokens per query - opt-in.
   reflection:
     enabled: false
+  # Plan-and-execute (:plan in harness.py): a planner splits a big task
+  # into sequential steps; each step runs in a fresh subagent with a clean
+  # context window and the full tool set
+  planning:
+    max_steps: 10
+    # Each prior step's result is excerpted to this many characters when
+    # carried into the next step's prompt
+    progress_excerpt_chars: 600
   # Every original prompt and answer is appended to logs/transcript.jsonl
   # so compressed inputs stay fully recoverable (no data loss)
   transcript:
@@ -77,7 +85,13 @@ memory:
   directory: memory
 
 orchestrator:
-  # Number of agents run in parallel by orchestrator.py / make_it_heavy.py
+  # Dynamic spawning: a cheap triage call classifies each request. Simple
+  # requests run a single agent (no fan-out, no synthesis); complex
+  # requests get a model-proposed agent count, clamped to max_agents
+  dynamic: true
+  # Hard cap on agents for any single request
+  max_agents: 8
+  # Used when dynamic is false, or as the fallback when triage fails
   parallel_agents: 4
   # Seconds to wait for parallel agents before giving up on stragglers
   task_timeout: 300
