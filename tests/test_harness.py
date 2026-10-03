@@ -302,7 +302,7 @@ class TestAgentWiring:
         agent.client.chat = type("Ch", (), {})()
         agent.client.chat.completions = fake
         agent.call_llm([{"role": "user", "content": "hi"}])
-        assert agent.get_usage() == {"prompt_tokens": 100, "completion_tokens": 20, "requests": 1}
+        assert agent.get_usage() == {"prompt_tokens": 100, "completion_tokens": 20, "cached_tokens": 0, "cost": 0.0, "requests": 1}
 
     def test_wire_messages_are_prepared(self, workdir):
         agent = self.make_agent(workdir)

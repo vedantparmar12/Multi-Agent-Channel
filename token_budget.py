@@ -214,6 +214,41 @@ class TokenBudget:
             kept.append(f"[... {omitted} older turn(s) omitted ...]")
         return header + "\n" + "\n".join(kept)
 
+    def compact_history(self, messages: List[Dict]) -> List[Dict]:
+        """Sticky compaction: rewrite the conversation in place when it
+        exceeds the budget, returning the messages folded into the digest.
+
+        View-only compaction (``prepare_messages``) rewrites the wire copy
+        on every call once the history is over budget, so the prompt prefix
+        changes each iteration and provider prompt caches can never hit.
+        Rewriting in place - once, at the moment the budget is crossed -
+        means subsequent iterations only append, and the prefix stays
+        byte-stable between compaction events. Callers should persist the
+        returned messages (the agent writes them to the transcript) so
+        compaction never loses data.
+        """
+        if estimate_messages_tokens(messages) <= self.history_budget:
+            return []
+
+        # messages[0] = system, messages[1] = original user request (if present)
+        head = messages[:2] if len(messages) > 1 and messages[1].get("role") == "user" else messages[:1]
+        tail = messages[-self.recent_turns_kept :]
+        middle = messages[len(head) : len(messages) - len(tail)]
+        if not middle:
+            return []
+
+        # The digest gets whatever budget remains after the verbatim parts
+        fixed_tokens = estimate_messages_tokens(head) + estimate_messages_tokens(tail)
+        digest_budget = max(
+            200,
+            (self.history_budget - fixed_tokens) * CHARS_PER_TOKEN - len(middle) * 20,
+        )
+        digest = {"role": "user", "content": self._digest(middle, digest_budget)}
+        dropped = [dict(message) for message in middle]
+        messages[:] = head + [digest] + tail
+        self.last_report["compacted"] = True
+        return dropped
+
     def prepare_messages(self, messages: List[Dict]) -> List[Dict]:
         """Apply truncation and compaction. Returns a new message list.
 

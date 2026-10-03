@@ -20,9 +20,22 @@ from typing import Dict, List, Optional
 
 import yaml
 
-from agent import OpenRouterAgent
+from agent import OpenRouterAgent, structured_output
+import tracing
 
 DEFAULT_MAX_STEPS = 10
+
+PLAN_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "step": {"type": "integer"},
+            "description": {"type": "string"},
+        },
+        "required": ["description"],
+    },
+}
 
 DEFAULT_PLANNER_PROMPT = """You are a task planner. Break this task into the
 minimum number of sequential steps that one capable AI agent each can
@@ -90,7 +103,16 @@ class PlanExecutor:
             planner.tools = []
             planner.tool_mapping = {}
             prompt = self.planner_prompt_template.format(task=task)
-            steps = self._parse_steps(planner.run(prompt))
+            with tracing.span("planner", attributes={
+                "gen_ai.system": "openrouter",
+                "gen_ai.operation.name": "plan",
+            }):
+                steps = self._parse_steps(
+                    planner.run(
+                        prompt,
+                        response_format=structured_output("plan", PLAN_SCHEMA),
+                    )
+                )
         except Exception as e:
             if not self.silent:
                 print(f"⚠️  Planner failed ({e}); running as a single step")
@@ -145,6 +167,13 @@ class PlanExecutor:
 
     def execute(self, task: str) -> Dict[str, object]:
         """Plan and run a task. Returns plan, per-step results, final answer."""
+        with tracing.span("plan_execute", attributes={
+            "gen_ai.system": "openrouter",
+            "gen_ai.operation.name": "plan_execute",
+        }):
+            return self._execute_impl(task)
+
+    def _execute_impl(self, task: str) -> Dict[str, object]:
         plan = self.create_plan(task)
         total = len(plan)
 
@@ -158,14 +187,25 @@ class PlanExecutor:
             # The prompt carries only the task, compact prior progress, and
             # this step's instruction - the step never sees prior transcripts.
             step_agent = OpenRouterAgent(silent=True)
-            prompt = DEFAULT_STEP_PROMPT.format(
-                task=task,
-                progress="\n".join(progress_lines) if progress_lines else "(starting - no steps completed yet)",
-                step_number=index,
-                total_steps=total,
-                description=step["description"],
-            )
-            results.append(step_agent.run(prompt))
+            try:
+                prompt = DEFAULT_STEP_PROMPT.format(
+                    task=task,
+                    progress="\n".join(progress_lines) if progress_lines else "(starting - no steps completed yet)",
+                    step_number=index,
+                    total_steps=total,
+                    description=step["description"],
+                )
+                with tracing.span(f"plan_step {index}", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "plan_step",
+                    "plan.step": index,
+                    "plan.total_steps": total,
+                }):
+                    results.append(step_agent.run(prompt))
+            finally:
+                close = getattr(step_agent, "close", None)
+                if callable(close):
+                    close()
             progress_lines.append(f"Step {index} ({step['description'][:60]}): {results[-1][:self.progress_excerpt_chars]}")
 
         final = self._synthesize(task, results)
@@ -183,7 +223,11 @@ class PlanExecutor:
                 f"=== STEP {i} RESULT ===\n{result}" for i, result in enumerate(results, 1)
             )
             prompt = DEFAULT_SYNTHESIS_PROMPT.format(task=task, results=results_text)
-            return synthesizer.run(prompt)
+            with tracing.span("synthesis", attributes={
+                "gen_ai.system": "openrouter",
+                "gen_ai.operation.name": "synthesis",
+            }):
+                return synthesizer.run(prompt)
         except Exception:
             # A failed synthesis must not lose the step results
             return "\n\n".join(

@@ -60,7 +60,7 @@ class FakeAgent:
         self.tool_mapping = {"some_tool": lambda **kw: {}}
         FakeAgent.created += 1
 
-    def run(self, prompt):
+    def run(self, prompt, **kwargs):
         FakeAgent.runs.append(prompt)
         if not FakeAgent.queue:
             raise AssertionError(f"unexpected agent.run() call, no scripted response left: {prompt[:80]}")

@@ -1,12 +1,15 @@
 import json
 import sys
+import uuid
 import yaml
 from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
 from tools import discover_tools
-from token_budget import TokenBudget
+from mcp_client import discover_mcp_tools
+from token_budget import TokenBudget, _tool_call_arguments, _tool_call_name
 from reliability import retry_call
+import tracing
 
 # Windows consoles often default to cp1252, where the progress emoji in the
 # non-silent prints below crash with UnicodeEncodeError (and the error
@@ -18,6 +21,24 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     except Exception:
         pass
+
+
+def structured_output(name: str, schema: dict) -> dict:
+    """response_format payload for provider-native structured outputs.
+
+    Callers pass this to ``agent.run(prompt, response_format=...)`` so the
+    model is constrained to emit schema-valid JSON instead of relying on
+    prompt instructions and lenient parsing.
+    """
+    return {"type": "json_schema", "json_schema": {"name": name, "schema": schema}}
+
+
+# Error texts that mean "this provider does not support response_format";
+# those are worth one plain retry, unlike ordinary outages
+STRUCTURED_OUTPUT_HINTS = (
+    "response_format", "json_schema", "json mode", "json_object",
+    "structured output",
+)
 
 class OpenRouterAgent:
     def __init__(self, config_path="config.yaml", silent=False, context_aware=True):
@@ -49,8 +70,19 @@ class OpenRouterAgent:
         self.transcript_enabled = transcript_config.get('enabled', True)
         self.transcript_path = Path('logs') / 'transcript.jsonl'
 
-        # Usage accumulated across all API calls in this agent's lifetime
-        self.usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "requests": 0}
+        # Usage accumulated across all API calls in this agent's lifetime.
+        # cached_tokens and cost come from OpenRouter's usage details, so
+        # spend reporting (:cost in harness.py) reflects real money.
+        self.usage_totals = {
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "cached_tokens": 0, "cost": 0.0, "requests": 0,
+        }
+        self.usage_by_model = {}
+
+        # OpenRouter session id: pins requests to one provider endpoint so
+        # prompt-cache prefixes actually hit across the loop's repeated
+        # calls. Auto-generated per agent unless configured.
+        self.session_id = self.config['openrouter'].get('session_id') or uuid.uuid4().hex[:16]
 
         # Persistent markdown-wiki memory (Karpathy-style). Memory tools in
         # tools/memory_tool.py build their own store pointed at the same
@@ -81,6 +113,9 @@ class OpenRouterAgent:
                     print(f"⚠️  Context loading failed: {e}")
                 self.context_aware = False
         
+        # Trace spans (logs/spans.jsonl) with OTel GenAI attribute names
+        tracing.configure(self.config.get('harness', {}).get('tracing', {}))
+
         # Initialize OpenAI client with OpenRouter
         self.client = OpenAI(
             base_url=self.config['openrouter']['base_url'],
@@ -92,34 +127,73 @@ class OpenRouterAgent:
         
         # Discover tools dynamically
         self.discovered_tools = discover_tools(self.config, silent=self.silent)
-        
+
+        # MCP servers (config mcp.servers): tools from any Model Context
+        # Protocol server join the built-in toolset. A server that cannot
+        # start contributes nothing - MCP is strictly additive.
+        self.mcp_clients = []
+        mcp_tools, self.mcp_clients = discover_mcp_tools(self.config, silent=self.silent)
+        self.discovered_tools.update(mcp_tools)
+
         # Build OpenRouter tools array
         self.tools = [tool.to_openrouter_schema() for tool in self.discovered_tools.values()]
-        
+
         # Build tool mapping
         self.tool_mapping = {name: tool.execute for name, tool in self.discovered_tools.items()}
+
+    def close(self):
+        """Release external resources (MCP server subprocesses)."""
+        for client in self.mcp_clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.mcp_clients = []
     
     
-    def call_llm(self, messages):
+    def call_llm(self, messages, response_format: dict = None):
         """Make an OpenRouter API call with retries and model fallback.
 
         The token-budget proxy runs first (messages are truncated/compacted
         just before hitting the wire), then each model is attempted with
         backoff on transient errors; non-transient errors fail over to the
         next model immediately since retrying cannot fix them.
+
+        When ``response_format`` is set and the provider rejects structured
+        outputs, the call degrades once to plain text instead of failing -
+        callers parse leniently, so the run continues either way.
         """
+        try:
+            return self._call_llm_format(messages, response_format)
+        except Exception as e:
+            if response_format is None:
+                raise
+            message = str(e).lower()
+            if not any(hint in message for hint in STRUCTURED_OUTPUT_HINTS):
+                raise
+            if not self.silent:
+                print("⚠️  structured outputs unavailable on this provider; retrying as plain text")
+            return self._call_llm_format(messages, None)
+
+    def _call_llm_format(self, messages, response_format: dict = None):
         prepared = self.budget.prepare_messages(messages)
         models = [self.config['openrouter']['model']] + self.fallback_models
         last_error = None
 
         for model in models:
             try:
-                response = retry_call(
-                    lambda m=model: self._create_completion(m, prepared),
-                    attempts=self.retry_attempts,
-                    base_delay=self.retry_base_delay,
-                )
-                self._record_usage(response)
+                with tracing.span("chat", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": model,
+                }) as trace:
+                    response = retry_call(
+                        lambda m=model, r=response_format: self._create_completion(m, prepared, r),
+                        attempts=self.retry_attempts,
+                        base_delay=self.retry_base_delay,
+                    )
+                    self._record_usage(response, model)
+                    tracing.set_usage_attributes(trace, getattr(response, "usage", None))
                 return response
             except Exception as e:
                 last_error = e
@@ -128,46 +202,151 @@ class OpenRouterAgent:
 
         raise Exception(f"LLM call failed: {last_error}")
 
-    def _create_completion(self, model, messages):
+    def _create_completion(self, model, messages, response_format: dict = None):
         request_kwargs = {
             "model": model,
             "messages": messages,
+            # OpenRouter routing hint: keeps the loop's requests on the
+            # same provider endpoint so prompt-cache prefixes survive
+            "extra_body": {"session_id": self.session_id},
         }
         # An empty tools array is rejected by many providers
         if self.tools:
             request_kwargs["tools"] = self.tools
+        if response_format is not None:
+            request_kwargs["response_format"] = response_format
         return self.client.chat.completions.create(**request_kwargs)
 
-    def _record_usage(self, response):
+    def _record_usage(self, response, model: str):
         """Accumulate real usage numbers returned by the API."""
         usage = getattr(response, "usage", None)
-        if usage:
-            self.usage_totals["prompt_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
-            self.usage_totals["completion_tokens"] += getattr(usage, "completion_tokens", 0) or 0
-            self.usage_totals["requests"] += 1
+        if not usage:
+            return
+        prompt = getattr(usage, "prompt_tokens", 0) or 0
+        completion = getattr(usage, "completion_tokens", 0) or 0
+        # prompt_tokens_details.cached_tokens is how much of the input hit
+        # a provider prompt cache (billed at a heavy discount)
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", 0) or 0
+        # usage.cost (USD) is OpenRouter-specific; absent on other stacks
+        cost = getattr(usage, "cost", None)
+
+        totals = self.usage_totals
+        totals["prompt_tokens"] += prompt
+        totals["completion_tokens"] += completion
+        totals["cached_tokens"] += cached
+        totals["cost"] += cost or 0.0
+        totals["requests"] += 1
+
+        per = self.usage_by_model.setdefault(model, {
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "cached_tokens": 0, "cost": 0.0, "requests": 0,
+        })
+        per["prompt_tokens"] += prompt
+        per["completion_tokens"] += completion
+        per["cached_tokens"] += cached
+        per["cost"] += cost or 0.0
+        per["requests"] += 1
 
     def get_usage(self):
         """Token usage across all calls made by this agent."""
         return dict(self.usage_totals)
 
-    def _append_transcript(self, original_input: str, output: str) -> None:
-        """Record the full, uncompressed input and final answer locally."""
+    def get_usage_by_model(self):
+        """Per-model usage breakdown across this agent's calls."""
+        return {model: dict(usage) for model, usage in self.usage_by_model.items()}
+
+    def _append_transcript(self, original_input: str, output: str,
+                           before: dict = None, before_by_model: dict = None) -> None:
+        """Record the full, uncompressed input and final answer locally.
+
+        When ``before`` snapshots are supplied (the normal path from
+        run()), the entry records the usage *delta* of this run so the
+        transcript can be summed per model without double-counting.
+        """
         if not self.transcript_enabled:
             return
         try:
             self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
             entry = {
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "model": self.config['openrouter']['model'],
                 "input": original_input,
                 "output": output,
-                "usage": self.get_usage(),
             }
+            if before is None:
+                entry["usage"] = self.get_usage()
+            else:
+                after = self.get_usage()
+                after_by_model = self.get_usage_by_model()
+                entry["usage"] = {
+                    key: after[key] - before.get(key, 0) for key in after
+                }
+                entry["by_model"] = {
+                    model: {
+                        key: usage[key] - before_by_model.get(model, {}).get(key, 0)
+                        for key in usage
+                    }
+                    for model, usage in after_by_model.items()
+                }
             with self.transcript_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception as e:
             # A failed transcript must never fail the run itself
             if not self.silent:
                 print(f"⚠️  Could not write transcript: {e}")
+
+    def _append_compaction_transcript(self, dropped_messages: list) -> None:
+        """Persist turns about to be folded into a compaction digest.
+
+        The wire copy of history is compressed, but every dropped turn
+        lands here verbatim first - compaction never loses data.
+        """
+        if not self.transcript_enabled or not dropped_messages:
+            return
+        try:
+            self.transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            entry = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "type": "compaction",
+                "dropped": [self._message_snapshot(m) for m in dropped_messages],
+            }
+            with self.transcript_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception as e:
+            if not self.silent:
+                print(f"⚠️  Could not write compaction transcript: {e}")
+
+    @staticmethod
+    def _message_snapshot(message: dict) -> dict:
+        """JSON-serializable copy of a message, tolerant of SDK tool-call
+        objects that json.dumps cannot serialize directly."""
+        snapshot = {"role": message.get("role")}
+        if message.get("content") is not None:
+            snapshot["content"] = message.get("content")
+        if message.get("name"):
+            snapshot["name"] = message.get("name")
+        if message.get("tool_calls"):
+            snapshot["tool_calls"] = [
+                {
+                    "name": _tool_call_name(tc),
+                    "arguments": _tool_call_arguments(tc),
+                }
+                for tc in message["tool_calls"]
+            ]
+        return snapshot
+
+    def compact_history(self, messages: list) -> int:
+        """Sticky in-place compaction of a live conversation. Returns the
+        number of turns folded into the digest (they are persisted to the
+        transcript first). Between compaction events the message list only
+        grows by appends, so the prompt prefix stays stable and provider
+        prompt caches can hit."""
+        dropped = self.budget.compact_history(messages)
+        if dropped:
+            self._append_compaction_transcript(dropped)
+        return len(dropped)
+
     
     def handle_tool_call(self, tool_call):
         """Handle a tool call and return the result message"""
@@ -179,7 +358,12 @@ class OpenRouterAgent:
 
             # Call appropriate tool from tool_mapping
             if tool_name in self.tool_mapping:
-                tool_result = self.tool_mapping[tool_name](**tool_args)
+                with tracing.span(f"tool {tool_name}", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "execute_tool",
+                    "gen_ai.tool.name": tool_name,
+                }):
+                    tool_result = self.tool_mapping[tool_name](**tool_args)
             else:
                 tool_result = {"error": f"Unknown tool: {tool_name}"}
             
@@ -226,32 +410,57 @@ class OpenRouterAgent:
 
         return prompt
     
-    def run(self, user_input: str):
+    def run(self, user_input: str, response_format: dict = None, history: list = None):
         """Run the agent with user input and return FULL conversation content.
 
         Overlong inputs are compressed for the wire, but the original text
         is preserved verbatim in the local transcript (logs/transcript.jsonl)
         so compression never loses data.
+
+        ``response_format`` (see ``structured_output``) constrains the
+        model to schema-valid JSON for callers like the orchestrator's
+        triage and the planner; unsupported providers degrade to plain
+        text automatically.
+
+        ``history`` (list of prior {"role", "content"} turns) is replayed
+        after the system prompt, giving the agent a conversation instead
+        of one-shot requests. The token budget compacts it when it
+        outgrows the budget.
         """
         system_prompt = self._build_system_prompt()
         original_input = user_input
-        result = self._run_loop(self.budget.compress_user_input(user_input), system_prompt)
-        self._append_transcript(original_input, result)
+        before = self.get_usage()
+        before_by_model = self.get_usage_by_model()
+        with tracing.span("agent.run", attributes={
+            "gen_ai.system": "openrouter",
+            "gen_ai.operation.name": "agent_run",
+            "gen_ai.request.model": self.config['openrouter']['model'],
+        }) as trace:
+            result = self._run_loop(
+                self.budget.compress_user_input(user_input), system_prompt,
+                response_format, history,
+            )
+            after = self.get_usage()
+            trace.set("gen_ai.usage.input_tokens", after["prompt_tokens"] - before.get("prompt_tokens", 0))
+            trace.set("gen_ai.usage.output_tokens", after["completion_tokens"] - before.get("completion_tokens", 0))
+            cached_delta = after["cached_tokens"] - before.get("cached_tokens", 0)
+            if cached_delta:
+                trace.set("gen_ai.usage.cached_tokens", cached_delta)
+            cost_delta = after["cost"] - before.get("cost", 0.0)
+            if cost_delta:
+                trace.set("gen_ai.usage.cost", round(cost_delta, 6))
+        self._append_transcript(original_input, result, before, before_by_model)
         return result
 
-    def _run_loop(self, user_input: str, system_prompt: str):
+    def _run_loop(self, user_input: str, system_prompt: str,
+                  response_format: dict = None, history: list = None):
         """The agentic loop itself. Returns the full response content."""
-        # Initialize messages with system prompt and user input
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_input
-            }
-        ]
+        # Initialize messages with system prompt, prior session turns,
+        # and the user input
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(dict(turn) for turn in history)
+        messages.append({"role": "user", "content": user_input})
         
         # Track all assistant responses for full content capture
         full_response_content = []
@@ -264,9 +473,15 @@ class OpenRouterAgent:
             iteration += 1
             if not self.silent:
                 print(f"🔄 Agent iteration {iteration}/{max_iterations}")
-            
+
+            # Sticky compaction: when the history crosses the budget it is
+            # rewritten in place (once), so every other iteration only
+            # appends and the prompt prefix stays byte-stable between
+            # compaction events - provider prompt caches can then hit.
+            self.compact_history(messages)
+
             # Call LLM
-            response = self.call_llm(messages)
+            response = self.call_llm(messages, response_format)
 
             # Add the response to messages. Only include tool_calls when the
             # model actually made some: a null tool_calls field is rejected
