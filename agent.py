@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from openai import OpenAI
 from tools import discover_tools
+from mcp_client import discover_mcp_tools
 from token_budget import TokenBudget, _tool_call_arguments, _tool_call_name
 from reliability import retry_call
 
@@ -122,12 +123,28 @@ class OpenRouterAgent:
         
         # Discover tools dynamically
         self.discovered_tools = discover_tools(self.config, silent=self.silent)
-        
+
+        # MCP servers (config mcp.servers): tools from any Model Context
+        # Protocol server join the built-in toolset. A server that cannot
+        # start contributes nothing - MCP is strictly additive.
+        self.mcp_clients = []
+        mcp_tools, self.mcp_clients = discover_mcp_tools(self.config, silent=self.silent)
+        self.discovered_tools.update(mcp_tools)
+
         # Build OpenRouter tools array
         self.tools = [tool.to_openrouter_schema() for tool in self.discovered_tools.values()]
-        
+
         # Build tool mapping
         self.tool_mapping = {name: tool.execute for name, tool in self.discovered_tools.items()}
+
+    def close(self):
+        """Release external resources (MCP server subprocesses)."""
+        for client in self.mcp_clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.mcp_clients = []
     
     
     def call_llm(self, messages, response_format: dict = None):

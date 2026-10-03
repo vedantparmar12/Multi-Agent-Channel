@@ -231,13 +231,19 @@ class TaskOrchestrator:
         """
         try:
             self.update_agent_progress(agent_id, "PROCESSING...")
-            
+
             # Use simple agent like in main.py
             agent = OpenRouterAgent(silent=True)
-            
-            start_time = time.time()
-            response = agent.run(subtask)
-            execution_time = time.time() - start_time
+            try:
+                start_time = time.time()
+                response = agent.run(subtask)
+                execution_time = time.time() - start_time
+            finally:
+                # Workers are created per subtask; release their MCP
+                # subprocesses (if any) right away instead of at exit
+                close = getattr(agent, "close", None)
+                if callable(close):
+                    close()
             
             self.update_agent_progress(agent_id, "COMPLETED", response)
             

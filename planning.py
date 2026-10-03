@@ -175,14 +175,19 @@ class PlanExecutor:
             # The prompt carries only the task, compact prior progress, and
             # this step's instruction - the step never sees prior transcripts.
             step_agent = OpenRouterAgent(silent=True)
-            prompt = DEFAULT_STEP_PROMPT.format(
-                task=task,
-                progress="\n".join(progress_lines) if progress_lines else "(starting - no steps completed yet)",
-                step_number=index,
-                total_steps=total,
-                description=step["description"],
-            )
-            results.append(step_agent.run(prompt))
+            try:
+                prompt = DEFAULT_STEP_PROMPT.format(
+                    task=task,
+                    progress="\n".join(progress_lines) if progress_lines else "(starting - no steps completed yet)",
+                    step_number=index,
+                    total_steps=total,
+                    description=step["description"],
+                )
+                results.append(step_agent.run(prompt))
+            finally:
+                close = getattr(step_agent, "close", None)
+                if callable(close):
+                    close()
             progress_lines.append(f"Step {index} ({step['description'][:60]}): {results[-1][:self.progress_excerpt_chars]}")
 
         final = self._synthesize(task, results)

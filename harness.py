@@ -55,6 +55,10 @@ class AgentHarness:
         # Per-run report, filled in by query()/ingest()/lint()
         self.last_report = {}
 
+    def close(self):
+        """Release external resources (the agent's MCP subprocesses)."""
+        self.agent.close()
+
     def query(self, user_input: str) -> str:
         """Answer a question with the full agent loop (tools + memory)."""
         before = self.agent.get_usage()
@@ -286,51 +290,54 @@ def main():
         print("2. Install dependencies with: pip install -r requirements.txt")
         return
 
-    while True:
-        try:
-            user_input = input("\nUser: ").strip()
+    try:
+        while True:
+            try:
+                user_input = input("\nUser: ").strip()
 
-            if user_input.lower() in ["quit", "exit", "bye"]:
-                print("Goodbye!")
+                if user_input.lower() in ["quit", "exit", "bye"]:
+                    print("Goodbye!")
+                    break
+
+                if not user_input:
+                    print("Please enter a question or command.")
+                    continue
+
+                if user_input.lower() == ":cost":
+                    print(harness.cost_report())
+                    continue
+
+                if user_input.lower() == ":lint":
+                    print("Agent: linting the memory wiki...")
+                    response = harness.lint()
+                elif user_input.lower().startswith(":plan"):
+                    task = user_input[len(":plan"):].strip()
+                    if not task:
+                        print("Usage: :plan <big task - planned into steps, each run by a fresh subagent>")
+                        continue
+                    print("Agent: planning and executing...")
+                    response = harness.plan_execute(task)
+                elif user_input.lower().startswith(":ingest"):
+                    source = user_input[len(":ingest"):].strip()
+                    if not source:
+                        print("Usage: :ingest <text to file into the wiki>")
+                        continue
+                    print("Agent: ingesting source into the wiki...")
+                    response = harness.ingest(source)
+                else:
+                    print("Agent: thinking...")
+                    response = harness.query(user_input)
+
+                print(f"Agent: {response}")
+
+            except KeyboardInterrupt:
+                print("\n\nExiting...")
                 break
-
-            if not user_input:
-                print("Please enter a question or command.")
-                continue
-
-            if user_input.lower() == ":cost":
-                print(harness.cost_report())
-                continue
-
-            if user_input.lower() == ":lint":
-                print("Agent: linting the memory wiki...")
-                response = harness.lint()
-            elif user_input.lower().startswith(":plan"):
-                task = user_input[len(":plan"):].strip()
-                if not task:
-                    print("Usage: :plan <big task - planned into steps, each run by a fresh subagent>")
-                    continue
-                print("Agent: planning and executing...")
-                response = harness.plan_execute(task)
-            elif user_input.lower().startswith(":ingest"):
-                source = user_input[len(":ingest"):].strip()
-                if not source:
-                    print("Usage: :ingest <text to file into the wiki>")
-                    continue
-                print("Agent: ingesting source into the wiki...")
-                response = harness.ingest(source)
-            else:
-                print("Agent: thinking...")
-                response = harness.query(user_input)
-
-            print(f"Agent: {response}")
-
-        except KeyboardInterrupt:
-            print("\n\nExiting...")
-            break
-        except Exception as e:
-            print(f"Error: {e}")
-            print("Please try again or type 'quit' to exit.")
+            except Exception as e:
+                print(f"Error: {e}")
+                print("Please try again or type 'quit' to exit.")
+    finally:
+        harness.close()
 
 
 if __name__ == "__main__":
