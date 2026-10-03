@@ -26,6 +26,9 @@ Or programmatically:
     answer = harness.query("what did we decide about caching?")
 """
 
+import json
+from pathlib import Path
+
 import yaml
 from agent import OpenRouterAgent
 
@@ -76,6 +79,85 @@ class AgentHarness:
         if not self.silent:
             print(f"🧩 Plan: {len(outcome['plan'])} step(s) executed")
         return answer
+
+    def cost_report(self) -> str:
+        """Aggregate real spend per model from logs/transcript.jsonl.
+
+        Transcript entries record per-run usage deltas (including
+        cached_tokens and OpenRouter's USD cost), so summing entries gives
+        lifetime totals without double-counting.
+        """
+        totals: dict = {}
+        runs = 0
+        path = Path("logs") / "transcript.jsonl"
+        try:
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("type") == "compaction":
+                        continue
+                    runs += 1
+                    per_model = entry.get("by_model")
+                    if per_model:
+                        for model, usage in per_model.items():
+                            self._add_usage(totals, model, usage)
+                    elif entry.get("usage"):
+                        # Entries predating per-model recording fall under
+                        # the entry's primary model
+                        self._add_usage(totals, entry.get("model") or "unknown", entry["usage"])
+        except FileNotFoundError:
+            return "No transcript yet (logs/transcript.jsonl) - nothing spent."
+
+        if not totals:
+            return "No usage recorded in the transcript yet."
+
+        lines = ["📊 Cost report (lifetime, from logs/transcript.jsonl)", ""]
+        lines.append(f"  {'model':<40} {'reqs':>5} {'tokens in (cached)':>22} "
+                     f"{'tokens out':>12} {'cost':>10}")
+        grand = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0,
+                 "cost": 0.0, "requests": 0}
+        for model in sorted(totals):
+            usage = totals[model]
+            for key in grand:
+                grand[key] += usage.get(key, 0) or 0
+            cost = usage.get("cost") or 0
+            cost_text = f"${cost:.4f}" if cost else "-"
+            lines.append(
+                f"  {model[:40]:<40} {usage.get('requests', 0):>5} "
+                f"{usage.get('prompt_tokens', 0):>12} "
+                f"({usage.get('cached_tokens', 0):>8}) "
+                f"{usage.get('completion_tokens', 0):>12} {cost_text:>10}"
+            )
+        lines.append("")
+        grand_cost = grand["cost"] or 0
+        lines.append(
+            f"  total: {runs} run(s), {grand['requests']} request(s), "
+            f"{grand['prompt_tokens']:,} tokens in ({grand['cached_tokens']:,} cached), "
+            f"{grand['completion_tokens']:,} tokens out"
+            + (f", ${grand_cost:.4f}" if grand_cost else " (cost unavailable)")
+        )
+
+        session = self.agent.get_usage()
+        if session["requests"]:
+            lines.append(
+                f"  this session: {session['requests']} request(s), "
+                f"{session['prompt_tokens']:,} tokens in "
+                f"({session['cached_tokens']:,} cached), "
+                f"{session['completion_tokens']:,} tokens out"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _add_usage(totals: dict, model: str, usage: dict) -> None:
+        agg = totals.setdefault(model, {
+            "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0,
+            "cost": 0.0, "requests": 0,
+        })
+        for key in agg:
+            agg[key] += usage.get(key, 0) or 0
 
     def _reflect(self, question: str, answer: str) -> str:
         """Adversarial critic pass: verify the answer, re-answer if flawed.
@@ -153,6 +235,7 @@ class AgentHarness:
             "action": action,
             "prompt_tokens": after["prompt_tokens"] - before["prompt_tokens"],
             "completion_tokens": after["completion_tokens"] - before["completion_tokens"],
+            "cached_tokens": after.get("cached_tokens", 0) - before.get("cached_tokens", 0),
             "requests": after["requests"] - before["requests"],
             "tool_results_truncated": budget.get("tool_results_truncated", 0),
             "history_compacted": budget.get("compacted", False),
@@ -163,9 +246,11 @@ class AgentHarness:
 
     def _print_report(self) -> None:
         report = self.last_report
+        cached = report.get("cached_tokens", 0)
+        cached_note = f" ({cached:,} cached)" if cached else ""
         print(
-            f"📊 tokens: {report['prompt_tokens']} in / "
-            f"{report['completion_tokens']} out "
+            f"📊 tokens: {report['prompt_tokens']:,} in{cached_note} / "
+            f"{report['completion_tokens']:,} out "
             f"({report['requests']} request(s))"
         )
         notes = []
@@ -181,7 +266,7 @@ def main():
     """Interactive CLI for the agent harness."""
     print("Agent Harness - loop + tools + persistent memory")
     print("Type 'quit', 'exit', or 'bye' to exit")
-    print("Commands: :ingest <source> | :lint | :plan <big task> | anything else is a query")
+    print("Commands: :ingest <source> | :lint | :plan <big task> | :cost | anything else is a query")
     print("-" * 60)
 
     try:
@@ -211,6 +296,10 @@ def main():
 
             if not user_input:
                 print("Please enter a question or command.")
+                continue
+
+            if user_input.lower() == ":cost":
+                print(harness.cost_report())
                 continue
 
             if user_input.lower() == ":lint":
