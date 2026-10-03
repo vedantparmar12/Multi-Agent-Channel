@@ -3,9 +3,11 @@ import re
 import yaml
 import time
 import threading
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Any, Optional
 from agent import OpenRouterAgent, structured_output
+import tracing
 
 FALLBACK_QUESTION_TEMPLATES = [
     "Research comprehensive information about: {user_input}",
@@ -165,12 +167,16 @@ class TaskOrchestrator:
                 user_input=user_input,
                 max_agents=self.max_dynamic_agents,
             )
-            parsed = self._parse_json_object(
-                triage_agent.run(
-                    prompt,
-                    response_format=structured_output("triage", TRIAGE_SCHEMA),
+            with tracing.span("triage", attributes={
+                "gen_ai.system": "openrouter",
+                "gen_ai.operation.name": "triage",
+            }):
+                parsed = self._parse_json_object(
+                    triage_agent.run(
+                        prompt,
+                        response_format=structured_output("triage", TRIAGE_SCHEMA),
+                    )
                 )
-            )
         except Exception:
             return fallback
 
@@ -236,7 +242,15 @@ class TaskOrchestrator:
             agent = OpenRouterAgent(silent=True)
             try:
                 start_time = time.time()
-                response = agent.run(subtask)
+                # Span opened in the worker thread: ThreadPoolExecutor copies
+                # the orchestrator's context at submit time, so this nests
+                # under the "orchestrate" span even across threads
+                with tracing.span(f"worker {agent_id}", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "worker",
+                    "agent.id": agent_id,
+                }):
+                    response = agent.run(subtask)
                 execution_time = time.time() - start_time
             finally:
                 # Workers are created per subtask; release their MCP
@@ -335,6 +349,13 @@ class TaskOrchestrator:
         firepower it needs (triage), delegates to agents, and returns the
         aggregated result.
         """
+        with tracing.span("orchestrate", attributes={
+            "gen_ai.system": "openrouter",
+            "gen_ai.operation.name": "orchestrate",
+        }):
+            return self._orchestrate_impl(user_input)
+
+    def _orchestrate_impl(self, user_input: str):
         # Reset progress tracking
         self.agent_progress = {}
         self.agent_results = {}
@@ -368,9 +389,14 @@ class TaskOrchestrator:
         agent_results = []
 
         with ThreadPoolExecutor(max_workers=num_agents) as executor:
-            # Submit all agent tasks
+            # Submit all agent tasks. A context snapshot per submit carries
+            # the orchestrate span into the worker thread (ThreadPoolExecutor
+            # only copies contextvars itself on Python 3.14+).
             future_to_agent = {
-                executor.submit(self.run_agent_parallel, i, subtasks[i]): i
+                executor.submit(
+                    contextvars.copy_context().run,
+                    self.run_agent_parallel, i, subtasks[i],
+                ): i
                 for i in range(num_agents)
             }
 

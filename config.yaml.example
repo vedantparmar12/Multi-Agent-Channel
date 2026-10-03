@@ -18,6 +18,12 @@ openrouter:
   # Per-request timeout in seconds. Keeps hung API calls from blocking
   # the agent loop and the orchestrator's thread pool forever.
   request_timeout: 120
+  # Routing hint sent with every request so repeated calls land on the
+  # same provider endpoint and prompt-cache prefixes actually hit
+  # (cached tokens are billed at a heavy discount). One is generated per
+  # agent automatically; set a fixed value only if you want agents to
+  # share a cache affinity.
+  # session_id: "my-stable-session"
 
 system_prompt: |
   You are a capable AI assistant with access to tools, including web
@@ -76,6 +82,12 @@ harness:
   # so compressed inputs stay fully recoverable (no data loss)
   transcript:
     enabled: true
+  # Trace spans: every run appends hierarchical spans (run -> chat ->
+  # tools, orchestrate -> triage -> workers, plan -> steps) to
+  # logs/spans.jsonl using OTel GenAI attribute names, so the file drops
+  # into OpenTelemetry-compatible tooling unchanged.
+  tracing:
+    enabled: true
 
 # Persistent markdown-wiki memory (Karpathy-style). The agent reads the
 # index in every system prompt and files knowledge itself via the
@@ -121,6 +133,18 @@ orchestrator:
     evidence. Respond directly with the final answer only.
 
     {agent_responses}
+
+# MCP (Model Context Protocol) servers: tools from any stdio MCP server
+# join the built-in toolset automatically. A server that fails to start
+# contributes nothing - MCP is strictly additive. Tool names are prefixed
+# mcp_<server>_<tool> to avoid collisions.
+mcp:
+  servers:
+    filesystem:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      # env: {}
+      # timeout: 30
 
 # Optional tool configuration
 search:

@@ -9,6 +9,7 @@ from tools import discover_tools
 from mcp_client import discover_mcp_tools
 from token_budget import TokenBudget, _tool_call_arguments, _tool_call_name
 from reliability import retry_call
+import tracing
 
 # Windows consoles often default to cp1252, where the progress emoji in the
 # non-silent prints below crash with UnicodeEncodeError (and the error
@@ -112,6 +113,9 @@ class OpenRouterAgent:
                     print(f"⚠️  Context loading failed: {e}")
                 self.context_aware = False
         
+        # Trace spans (logs/spans.jsonl) with OTel GenAI attribute names
+        tracing.configure(self.config.get('harness', {}).get('tracing', {}))
+
         # Initialize OpenAI client with OpenRouter
         self.client = OpenAI(
             base_url=self.config['openrouter']['base_url'],
@@ -178,12 +182,18 @@ class OpenRouterAgent:
 
         for model in models:
             try:
-                response = retry_call(
-                    lambda m=model, r=response_format: self._create_completion(m, prepared, r),
-                    attempts=self.retry_attempts,
-                    base_delay=self.retry_base_delay,
-                )
-                self._record_usage(response, model)
+                with tracing.span("chat", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": model,
+                }) as trace:
+                    response = retry_call(
+                        lambda m=model, r=response_format: self._create_completion(m, prepared, r),
+                        attempts=self.retry_attempts,
+                        base_delay=self.retry_base_delay,
+                    )
+                    self._record_usage(response, model)
+                    tracing.set_usage_attributes(trace, getattr(response, "usage", None))
                 return response
             except Exception as e:
                 last_error = e
@@ -348,7 +358,12 @@ class OpenRouterAgent:
 
             # Call appropriate tool from tool_mapping
             if tool_name in self.tool_mapping:
-                tool_result = self.tool_mapping[tool_name](**tool_args)
+                with tracing.span(f"tool {tool_name}", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "execute_tool",
+                    "gen_ai.tool.name": tool_name,
+                }):
+                    tool_result = self.tool_mapping[tool_name](**tool_args)
             else:
                 tool_result = {"error": f"Unknown tool: {tool_name}"}
             
@@ -416,10 +431,24 @@ class OpenRouterAgent:
         original_input = user_input
         before = self.get_usage()
         before_by_model = self.get_usage_by_model()
-        result = self._run_loop(
-            self.budget.compress_user_input(user_input), system_prompt,
-            response_format, history,
-        )
+        with tracing.span("agent.run", attributes={
+            "gen_ai.system": "openrouter",
+            "gen_ai.operation.name": "agent_run",
+            "gen_ai.request.model": self.config['openrouter']['model'],
+        }) as trace:
+            result = self._run_loop(
+                self.budget.compress_user_input(user_input), system_prompt,
+                response_format, history,
+            )
+            after = self.get_usage()
+            trace.set("gen_ai.usage.input_tokens", after["prompt_tokens"] - before.get("prompt_tokens", 0))
+            trace.set("gen_ai.usage.output_tokens", after["completion_tokens"] - before.get("completion_tokens", 0))
+            cached_delta = after["cached_tokens"] - before.get("cached_tokens", 0)
+            if cached_delta:
+                trace.set("gen_ai.usage.cached_tokens", cached_delta)
+            cost_delta = after["cost"] - before.get("cost", 0.0)
+            if cost_delta:
+                trace.set("gen_ai.usage.cost", round(cost_delta, 6))
         self._append_transcript(original_input, result, before, before_by_model)
         return result
 

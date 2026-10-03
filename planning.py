@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 import yaml
 
 from agent import OpenRouterAgent, structured_output
+import tracing
 
 DEFAULT_MAX_STEPS = 10
 
@@ -102,12 +103,16 @@ class PlanExecutor:
             planner.tools = []
             planner.tool_mapping = {}
             prompt = self.planner_prompt_template.format(task=task)
-            steps = self._parse_steps(
-                planner.run(
-                    prompt,
-                    response_format=structured_output("plan", PLAN_SCHEMA),
+            with tracing.span("planner", attributes={
+                "gen_ai.system": "openrouter",
+                "gen_ai.operation.name": "plan",
+            }):
+                steps = self._parse_steps(
+                    planner.run(
+                        prompt,
+                        response_format=structured_output("plan", PLAN_SCHEMA),
+                    )
                 )
-            )
         except Exception as e:
             if not self.silent:
                 print(f"⚠️  Planner failed ({e}); running as a single step")
@@ -162,6 +167,13 @@ class PlanExecutor:
 
     def execute(self, task: str) -> Dict[str, object]:
         """Plan and run a task. Returns plan, per-step results, final answer."""
+        with tracing.span("plan_execute", attributes={
+            "gen_ai.system": "openrouter",
+            "gen_ai.operation.name": "plan_execute",
+        }):
+            return self._execute_impl(task)
+
+    def _execute_impl(self, task: str) -> Dict[str, object]:
         plan = self.create_plan(task)
         total = len(plan)
 
@@ -183,7 +195,13 @@ class PlanExecutor:
                     total_steps=total,
                     description=step["description"],
                 )
-                results.append(step_agent.run(prompt))
+                with tracing.span(f"plan_step {index}", attributes={
+                    "gen_ai.system": "openrouter",
+                    "gen_ai.operation.name": "plan_step",
+                    "plan.step": index,
+                    "plan.total_steps": total,
+                }):
+                    results.append(step_agent.run(prompt))
             finally:
                 close = getattr(step_agent, "close", None)
                 if callable(close):
@@ -205,7 +223,11 @@ class PlanExecutor:
                 f"=== STEP {i} RESULT ===\n{result}" for i, result in enumerate(results, 1)
             )
             prompt = DEFAULT_SYNTHESIS_PROMPT.format(task=task, results=results_text)
-            return synthesizer.run(prompt)
+            with tracing.span("synthesis", attributes={
+                "gen_ai.system": "openrouter",
+                "gen_ai.operation.name": "synthesis",
+            }):
+                return synthesizer.run(prompt)
         except Exception:
             # A failed synthesis must not lose the step results
             return "\n\n".join(
