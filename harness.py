@@ -55,16 +55,34 @@ class AgentHarness:
         # Per-run report, filled in by query()/ingest()/lint()
         self.last_report = {}
 
+        # Rolling REPL session: prior query turns are replayed as history
+        # so follow-up questions ("and why is that?") work. The wiki in
+        # memory/ is the durable knowledge; this is the live conversation.
+        self.session = []
+
     def close(self):
         """Release external resources (the agent's MCP subprocesses)."""
         self.agent.close()
 
+    def reset_session(self):
+        """Forget the live conversation (the memory wiki is unaffected)."""
+        self.session = []
+
     def query(self, user_input: str) -> str:
-        """Answer a question with the full agent loop (tools + memory)."""
+        """Answer a question with the full agent loop (tools + memory).
+
+        Queries share the rolling session: prior turns are replayed as
+        history, then the session is bounded with the same sticky
+        compaction the agent loop uses (dropped turns persist to the
+        transcript, so nothing is lost).
+        """
         before = self.agent.get_usage()
-        answer = self.agent.run(user_input)
+        answer = self.agent.run(user_input, history=self.session)
         if self.reflection_enabled and answer:
             answer = self._reflect(user_input, answer)
+        self.session.append({"role": "user", "content": user_input})
+        self.session.append({"role": "assistant", "content": answer})
+        self.agent.compact_history(self.session)
         return self._finish("query", user_input, before, answer)
 
     def plan_execute(self, task: str) -> str:
@@ -270,7 +288,7 @@ def main():
     """Interactive CLI for the agent harness."""
     print("Agent Harness - loop + tools + persistent memory")
     print("Type 'quit', 'exit', or 'bye' to exit")
-    print("Commands: :ingest <source> | :lint | :plan <big task> | :cost | anything else is a query")
+    print("Commands: :ingest <source> | :lint | :plan <big task> | :cost | :reset | anything else is a query")
     print("-" * 60)
 
     try:
@@ -305,6 +323,11 @@ def main():
 
                 if user_input.lower() == ":cost":
                     print(harness.cost_report())
+                    continue
+
+                if user_input.lower() == ":reset":
+                    harness.reset_session()
+                    print("Session cleared (memory wiki is untouched).")
                     continue
 
                 if user_input.lower() == ":lint":

@@ -395,7 +395,7 @@ class OpenRouterAgent:
 
         return prompt
     
-    def run(self, user_input: str, response_format: dict = None):
+    def run(self, user_input: str, response_format: dict = None, history: list = None):
         """Run the agent with user input and return FULL conversation content.
 
         Overlong inputs are compressed for the wire, but the original text
@@ -406,30 +406,32 @@ class OpenRouterAgent:
         model to schema-valid JSON for callers like the orchestrator's
         triage and the planner; unsupported providers degrade to plain
         text automatically.
+
+        ``history`` (list of prior {"role", "content"} turns) is replayed
+        after the system prompt, giving the agent a conversation instead
+        of one-shot requests. The token budget compacts it when it
+        outgrows the budget.
         """
         system_prompt = self._build_system_prompt()
         original_input = user_input
         before = self.get_usage()
         before_by_model = self.get_usage_by_model()
         result = self._run_loop(
-            self.budget.compress_user_input(user_input), system_prompt, response_format
+            self.budget.compress_user_input(user_input), system_prompt,
+            response_format, history,
         )
         self._append_transcript(original_input, result, before, before_by_model)
         return result
 
-    def _run_loop(self, user_input: str, system_prompt: str, response_format: dict = None):
+    def _run_loop(self, user_input: str, system_prompt: str,
+                  response_format: dict = None, history: list = None):
         """The agentic loop itself. Returns the full response content."""
-        # Initialize messages with system prompt and user input
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_input
-            }
-        ]
+        # Initialize messages with system prompt, prior session turns,
+        # and the user input
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(dict(turn) for turn in history)
+        messages.append({"role": "user", "content": user_input})
         
         # Track all assistant responses for full content capture
         full_response_content = []
