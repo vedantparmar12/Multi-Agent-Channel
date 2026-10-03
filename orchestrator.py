@@ -5,7 +5,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Any, Optional
-from agent import OpenRouterAgent
+from agent import OpenRouterAgent, structured_output
 
 FALLBACK_QUESTION_TEMPLATES = [
     "Research comprehensive information about: {user_input}",
@@ -15,6 +15,18 @@ FALLBACK_QUESTION_TEMPLATES = [
 ]
 
 DEFAULT_MAX_DYNAMIC_AGENTS = 8
+
+TRIAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "complexity": {"type": "string", "enum": ["simple", "complex"]},
+        "num_agents": {"type": "integer"},
+        "reasoning": {"type": "string"},
+    },
+    "required": ["complexity", "num_agents"],
+}
+
+QUESTIONS_SCHEMA = {"type": "array", "items": {"type": "string"}}
 
 DEFAULT_TRIAGE_PROMPT = """You are a request triage router for a multi-agent system.
 
@@ -89,8 +101,12 @@ class TaskOrchestrator:
         question_agent.tool_mapping = {name: func for name, func in question_agent.tool_mapping.items() if name != 'mark_task_complete'}
         
         try:
-            # Get AI-generated questions
-            response = question_agent.run(generation_prompt)
+            # Get AI-generated questions (schema-constrained when the
+            # provider supports structured outputs, plain text otherwise)
+            response = question_agent.run(
+                generation_prompt,
+                response_format=structured_output("questions", QUESTIONS_SCHEMA),
+            )
             questions = self._parse_questions(response)
         except Exception:
             # Any failure (API error, malformed output) falls back to
@@ -149,7 +165,12 @@ class TaskOrchestrator:
                 user_input=user_input,
                 max_agents=self.max_dynamic_agents,
             )
-            parsed = self._parse_json_object(triage_agent.run(prompt))
+            parsed = self._parse_json_object(
+                triage_agent.run(
+                    prompt,
+                    response_format=structured_output("triage", TRIAGE_SCHEMA),
+                )
+            )
         except Exception:
             return fallback
 

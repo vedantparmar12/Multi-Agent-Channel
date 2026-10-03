@@ -20,6 +20,24 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
+
+def structured_output(name: str, schema: dict) -> dict:
+    """response_format payload for provider-native structured outputs.
+
+    Callers pass this to ``agent.run(prompt, response_format=...)`` so the
+    model is constrained to emit schema-valid JSON instead of relying on
+    prompt instructions and lenient parsing.
+    """
+    return {"type": "json_schema", "json_schema": {"name": name, "schema": schema}}
+
+
+# Error texts that mean "this provider does not support response_format";
+# those are worth one plain retry, unlike ordinary outages
+STRUCTURED_OUTPUT_HINTS = (
+    "response_format", "json_schema", "json mode", "json_object",
+    "structured output",
+)
+
 class OpenRouterAgent:
     def __init__(self, config_path="config.yaml", silent=False, context_aware=True):
         # Load configuration
@@ -112,14 +130,31 @@ class OpenRouterAgent:
         self.tool_mapping = {name: tool.execute for name, tool in self.discovered_tools.items()}
     
     
-    def call_llm(self, messages):
+    def call_llm(self, messages, response_format: dict = None):
         """Make an OpenRouter API call with retries and model fallback.
 
         The token-budget proxy runs first (messages are truncated/compacted
         just before hitting the wire), then each model is attempted with
         backoff on transient errors; non-transient errors fail over to the
         next model immediately since retrying cannot fix them.
+
+        When ``response_format`` is set and the provider rejects structured
+        outputs, the call degrades once to plain text instead of failing -
+        callers parse leniently, so the run continues either way.
         """
+        try:
+            return self._call_llm_format(messages, response_format)
+        except Exception as e:
+            if response_format is None:
+                raise
+            message = str(e).lower()
+            if not any(hint in message for hint in STRUCTURED_OUTPUT_HINTS):
+                raise
+            if not self.silent:
+                print("⚠️  structured outputs unavailable on this provider; retrying as plain text")
+            return self._call_llm_format(messages, None)
+
+    def _call_llm_format(self, messages, response_format: dict = None):
         prepared = self.budget.prepare_messages(messages)
         models = [self.config['openrouter']['model']] + self.fallback_models
         last_error = None
@@ -127,7 +162,7 @@ class OpenRouterAgent:
         for model in models:
             try:
                 response = retry_call(
-                    lambda m=model: self._create_completion(m, prepared),
+                    lambda m=model, r=response_format: self._create_completion(m, prepared, r),
                     attempts=self.retry_attempts,
                     base_delay=self.retry_base_delay,
                 )
@@ -140,7 +175,7 @@ class OpenRouterAgent:
 
         raise Exception(f"LLM call failed: {last_error}")
 
-    def _create_completion(self, model, messages):
+    def _create_completion(self, model, messages, response_format: dict = None):
         request_kwargs = {
             "model": model,
             "messages": messages,
@@ -151,6 +186,8 @@ class OpenRouterAgent:
         # An empty tools array is rejected by many providers
         if self.tools:
             request_kwargs["tools"] = self.tools
+        if response_format is not None:
+            request_kwargs["response_format"] = response_format
         return self.client.chat.completions.create(**request_kwargs)
 
     def _record_usage(self, response, model: str):
@@ -341,22 +378,29 @@ class OpenRouterAgent:
 
         return prompt
     
-    def run(self, user_input: str):
+    def run(self, user_input: str, response_format: dict = None):
         """Run the agent with user input and return FULL conversation content.
 
         Overlong inputs are compressed for the wire, but the original text
         is preserved verbatim in the local transcript (logs/transcript.jsonl)
         so compression never loses data.
+
+        ``response_format`` (see ``structured_output``) constrains the
+        model to schema-valid JSON for callers like the orchestrator's
+        triage and the planner; unsupported providers degrade to plain
+        text automatically.
         """
         system_prompt = self._build_system_prompt()
         original_input = user_input
         before = self.get_usage()
         before_by_model = self.get_usage_by_model()
-        result = self._run_loop(self.budget.compress_user_input(user_input), system_prompt)
+        result = self._run_loop(
+            self.budget.compress_user_input(user_input), system_prompt, response_format
+        )
         self._append_transcript(original_input, result, before, before_by_model)
         return result
 
-    def _run_loop(self, user_input: str, system_prompt: str):
+    def _run_loop(self, user_input: str, system_prompt: str, response_format: dict = None):
         """The agentic loop itself. Returns the full response content."""
         # Initialize messages with system prompt and user input
         messages = [
@@ -389,7 +433,7 @@ class OpenRouterAgent:
             self.compact_history(messages)
 
             # Call LLM
-            response = self.call_llm(messages)
+            response = self.call_llm(messages, response_format)
 
             # Add the response to messages. Only include tool_calls when the
             # model actually made some: a null tool_calls field is rejected

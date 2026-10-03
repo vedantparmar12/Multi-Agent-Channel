@@ -20,9 +20,21 @@ from typing import Dict, List, Optional
 
 import yaml
 
-from agent import OpenRouterAgent
+from agent import OpenRouterAgent, structured_output
 
 DEFAULT_MAX_STEPS = 10
+
+PLAN_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "step": {"type": "integer"},
+            "description": {"type": "string"},
+        },
+        "required": ["description"],
+    },
+}
 
 DEFAULT_PLANNER_PROMPT = """You are a task planner. Break this task into the
 minimum number of sequential steps that one capable AI agent each can
@@ -90,7 +102,12 @@ class PlanExecutor:
             planner.tools = []
             planner.tool_mapping = {}
             prompt = self.planner_prompt_template.format(task=task)
-            steps = self._parse_steps(planner.run(prompt))
+            steps = self._parse_steps(
+                planner.run(
+                    prompt,
+                    response_format=structured_output("plan", PLAN_SCHEMA),
+                )
+            )
         except Exception as e:
             if not self.silent:
                 print(f"⚠️  Planner failed ({e}); running as a single step")
