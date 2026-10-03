@@ -84,8 +84,13 @@ itself. This project is those three things plus a cost guard:
    in a growing transcript. A final synthesis assembles the answer.
 8. **MCP tools** (`mcp_client.py`) — servers listed under `mcp.servers` are
    launched over stdio, handshaked, and their tools join the built-in set
-   (prefixed `mcp_<server>_<tool>`). A server that fails to start is
-   skipped — MCP is strictly additive, stdlib only, no SDK required.
+   (prefixed `mcp_<server>_<tool>`). Implements the official client best
+   practices: protocol-version negotiation, paginated `tools/list`, live
+   tool reload on `notifications/tools/list_changed`, JSON-RPC replies to
+   server-initiated requests (ping answered, unknown → `-32601`),
+   cancellation notifications on timeouts, server stderr captured to
+   `logs/mcp-<server>.log`, and the spec's graceful shutdown order. A
+   server that fails to start is skipped — strictly additive, stdlib only.
 9. **Tracing** (`tracing.py`) — every run, LLM call, tool call, triage,
    worker, and plan step appends a span to `logs/spans.jsonl` with
    OpenTelemetry GenAI attribute names, one tree per request (workers nest
