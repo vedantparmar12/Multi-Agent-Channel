@@ -137,7 +137,9 @@ orchestrator:
 # MCP (Model Context Protocol) servers: tools from any stdio MCP server
 # join the built-in toolset automatically. A server that fails to start
 # contributes nothing - MCP is strictly additive. Tool names are prefixed
-# mcp_<server>_<tool> to avoid collisions.
+# mcp_<server>_<tool> to avoid collisions. Server log output (stderr) is
+# captured to logs/mcp-<server>.log; tool lists reload live when a server
+# announces notifications/tools/list_changed.
 mcp:
   servers:
     filesystem:
